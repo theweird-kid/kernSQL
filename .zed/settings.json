@@ -3,7 +3,7 @@
     "C++": {
       "format_on_save": "on",
       "formatter": "language_server",
-      "tab_size": 2,
+      "tab_size": 4,
     },
     "C": {
       "format_on_save": "on",
