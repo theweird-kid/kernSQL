@@ -1,0 +1,23 @@
+name: ci
+on:
+  push: { branches: [main] }
+  pull_request:
+jobs:
+  sanitize:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix: { preset: [asan, tsan] }
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y ninja-build clang
+      - run: cmake --preset ${{ matrix.preset }}
+      - run: cmake --build --preset ${{ matrix.preset }} --parallel
+      - run: ctest --preset ${{ matrix.preset }}
+  format:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          sudo apt-get update && sudo apt-get install -y clang-format
+          find src test -name '*.cpp' -o -name '*.h' | xargs clang-format --dry-run --Werror
