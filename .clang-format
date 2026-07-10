@@ -2,8 +2,11 @@ BasedOnStyle: Google
 ColumnLimit: 100
 DerivePointerAlignment: false
 PointerAlignment: Left
-IndentWidth: 2
-AccessModifierOffset: -1
+UseTab: ForIndentation
+IndentWidth: 4
+TabWidth: 4
+ContinuationIndentWidth: 4
+AccessModifierOffset: -2
 AllowShortFunctionsOnASingleLine: Inline
 IncludeBlocks: Regroup
 SortIncludes: CaseSensitive

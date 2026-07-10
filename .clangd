@@ -1,0 +1,6 @@
+CompileFlags:
+  CompilationDatabase: build/debug
+Diagnostics:
+  ClangTidy:
+    Add: [bugprone-*, performance-*, concurrency-*]
+    Remove: [bugprone-easily-swappable-parameters]
