@@ -13,12 +13,12 @@
             "state": {
               "type": "markdown",
               "state": {
-                "file": "design-docs/notes/Indexes.md",
-                "mode": "source",
+                "file": "design-docs/DD-001-storage-file-layout.md",
+                "mode": "preview",
                 "source": false
               },
               "icon": "lucide-file",
-              "title": "Indexes"
+              "title": "DD-001-storage-file-layout"
             }
           }
         ]
@@ -78,7 +78,8 @@
       }
     ],
     "direction": "horizontal",
-    "width": 300
+    "width": 300,
+    "collapsed": true
   },
   "right": {
     "id": "4ce9e65978c028c9",
@@ -94,7 +95,7 @@
             "state": {
               "type": "backlink",
               "state": {
-                "file": "design-docs/notes/Indexes.md",
+                "file": "design-docs/DD-001-storage-file-layout.md",
                 "collapseAll": false,
                 "extraContext": false,
                 "sortOrder": "alphabetical",
@@ -104,7 +105,7 @@
                 "unlinkedCollapsed": true
               },
               "icon": "links-coming-in",
-              "title": "Backlinks for Indexes"
+              "title": "Backlinks for DD-001-storage-file-layout"
             }
           },
           {
@@ -113,12 +114,12 @@
             "state": {
               "type": "outgoing-link",
               "state": {
-                "file": "design-docs/notes/Indexes.md",
+                "file": "design-docs/DD-001-storage-file-layout.md",
                 "linksCollapsed": false,
                 "unlinkedCollapsed": true
               },
               "icon": "links-going-out",
-              "title": "Outgoing links from Indexes"
+              "title": "Outgoing links from DD-001-storage-file-layout"
             }
           },
           {
@@ -156,13 +157,13 @@
             "state": {
               "type": "outline",
               "state": {
-                "file": "design-docs/notes/Indexes.md",
+                "file": "design-docs/DD-001-storage-file-layout.md",
                 "followCursor": false,
                 "showSearch": false,
                 "searchQuery": ""
               },
               "icon": "lucide-list",
-              "title": "Outline of Indexes"
+              "title": "Outline of DD-001-storage-file-layout"
             }
           }
         ],
@@ -170,7 +171,8 @@
       }
     ],
     "direction": "horizontal",
-    "width": 300
+    "width": 300,
+    "collapsed": true
   },
   "left-ribbon": {
     "hiddenItems": {
@@ -185,19 +187,22 @@
   },
   "active": "b27174596c7c49e7",
   "lastOpenFiles": [
-    "build/debug/CMakeFiles/status_test.dir/link.d",
-    "build/debug/stFyqwNI",
-    "build/debug/stVVENQj",
-    "build/debug/CMakeFiles/kernsql_lib.dir/src/storage/disk_manager.cpp.o.d",
-    "build/debug/stiL9vih",
-    "build/debug/stxX3Db8",
-    "build/debug/CMakeCache.txt.tmp6133f",
-    "build/debug/_deps/googletest-build/googletest/cmake_install.cmake.tmp70c68",
-    "build/debug/compile_commands.json.tmp9df26",
-    "build/debug/CMakeFiles/rules.ninja.tmpbb6a3",
-    "build/debug/build.ninja.tmp3b116",
-    "Untitled.canvas",
+    "design-docs/DD-001-storage-file-layout.md.tmp.7860.b44baac87252",
+    "design-docs/DD-001-storage-file-layout.md.tmp.7860.ebe3c4908c70",
+    "assets/slotted_page.png.crswap",
+    "assets/slotted_page.png",
+    "assets/storage_file_layout.png.crswap",
+    "assets/storage_file_layout.png",
+    "design-docs/DD-001-storage-file-layout.md.tmp.7860.481c09bc0eec",
     "design-docs/notes/Indexes.md",
+    "design-docs/DD-001-storage-file-layout.md",
+    "build/asan/Testing/Temporary/CTestCheckpoint.txt",
+    "build/asan/Testing/Temporary/LastTest.log.tmp",
+    "build/asan/sttE0V0g",
+    "build/asan/stpGGHxE",
+    "build/asan/CMakeFiles/kernsql_lib.dir/src/storage/disk_manager.cpp.o",
+    "build/asan/CMakeFiles/kernsql.dir/src/shell/main.cpp-8315f77a.o.tmp",
+    "Untitled.canvas",
     "README.md"
   ]
 }

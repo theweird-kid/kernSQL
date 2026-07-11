@@ -14,6 +14,7 @@ class DiskManager {
   public:
 	static Result<std::unique_ptr<DiskManager>> Open(const std::filesystem::path& path);
 	~DiskManager();
+
 	DiskManager(const DiskManager&) = delete;
 	DiskManager& operator=(const DiskManager&) = delete;
 	DiskManager(DiskManager&&) = delete;
@@ -21,7 +22,10 @@ class DiskManager {
 
 	Status ReadPage(page_id_t page_id, std::span<std::byte, PAGE_SIZE> out);
 	Status WritePage(page_id_t page_id, std::span<const std::byte, PAGE_SIZE> in);
-	[[nodiscard]] Result<page_id_t> AllocatePage();
+
+	[[nodiscard]]
+	Result<page_id_t> AllocatePage();
+
 	Status DeallocatePage(page_id_t page_id);
 	Status Sync();
 	page_id_t PageCount() const;
@@ -29,8 +33,12 @@ class DiskManager {
   private:
 	DiskManager(int fd, std::filesystem::path path, page_id_t page_count);
 
+	[[nodiscard]]
+	bool valid_page(page_id_t page_id);
+
 	int fd_;
 	std::filesystem::path path_;
+	page_id_t freelist_head_{INVALID_PAGE};
 	page_id_t page_count_{0};
 };
 

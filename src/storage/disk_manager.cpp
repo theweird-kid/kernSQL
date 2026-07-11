@@ -5,8 +5,10 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+#include <cstddef>
 #include <expected>
 #include <filesystem>
+#include <format>
 #include <memory>
 #include <print>
 
@@ -57,5 +59,36 @@ Status DiskManager::Sync() {
 	return Status::OK();
 }
 
-Status DiskManager::ReadPage(page_id_t page_id, std::span<std::byte, PAGE_SIZE> out) {}
-Status DiskManager::WritePage(page_id_t page_id, std::span<const std::byte, PAGE_SIZE> in) {}
+bool DiskManager::valid_page(page_id_t page_id) {
+	return page_id >= 0 && page_id < this->page_count_;
+}
+
+Status DiskManager::ReadPage(page_id_t page_id, std::span<std::byte, PAGE_SIZE> out) {
+	if (!valid_page(page_id)) {
+		return Status::InvalidArgument(
+		    std::format("invalid page id {}, page id < {}", page_id, this->page_count_));
+	}
+
+	ssize_t status =
+	    pread(this->fd_, out.data(), PAGE_SIZE, static_cast<off_t>(page_id * PAGE_SIZE));
+	if (status != static_cast<ssize_t>(PAGE_SIZE)) {
+		return Status::IOError("failed to read page");
+	}
+
+	return Status::OK();
+}
+
+Status DiskManager::WritePage(page_id_t page_id, std::span<const std::byte, PAGE_SIZE> in) {
+	if (!valid_page(page_id)) {
+		return Status::InvalidArgument(
+		    std::format("invalid page id {}, page id < {}", page_id, this->page_count_));
+	}
+
+	ssize_t status =
+	    pwrite(this->fd_, in.data(), PAGE_SIZE, static_cast<off_t>(page_id * PAGE_SIZE));
+	if (status != static_cast<ssize_t>(PAGE_SIZE)) {
+		return Status::IOError("failed to write to page");
+	}
+
+	return Status::OK();
+}
