@@ -6,7 +6,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)   # for clangd
 
-add_library(kernsql_lib STATIC src/common/placeholder.cpp)
+add_library(kernsql_lib STATIC src/common/placeholder.cpp src/storage/disk_manager.cpp)
 target_include_directories(kernsql_lib PUBLIC src)
 target_compile_options(kernsql_lib PUBLIC -Wall -Wextra -Wpedantic -Wshadow -Wconversion)
 
