@@ -187,6 +187,10 @@
   },
   "active": "b27174596c7c49e7",
   "lastOpenFiles": [
+    "src/storage/disk_manager.cpp.tmp.9965.8ff5732d0455",
+    "src/storage/disk_manager.cpp.tmp.9965.d32c4c2f3088",
+    "src/common/page_header.hpp",
+    "src/storage/page_header.hpp",
     "design-docs/DD-001-storage-file-layout.md.tmp.7860.b44baac87252",
     "design-docs/DD-001-storage-file-layout.md.tmp.7860.ebe3c4908c70",
     "assets/slotted_page.png.crswap",
@@ -198,10 +202,6 @@
     "design-docs/DD-001-storage-file-layout.md",
     "build/asan/Testing/Temporary/CTestCheckpoint.txt",
     "build/asan/Testing/Temporary/LastTest.log.tmp",
-    "build/asan/sttE0V0g",
-    "build/asan/stpGGHxE",
-    "build/asan/CMakeFiles/kernsql_lib.dir/src/storage/disk_manager.cpp.o",
-    "build/asan/CMakeFiles/kernsql.dir/src/shell/main.cpp-8315f77a.o.tmp",
     "Untitled.canvas",
     "README.md"
   ]

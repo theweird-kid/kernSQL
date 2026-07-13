@@ -5,6 +5,7 @@
 #include <memory>
 #include <span>
 
+#include "common/page_header.hpp"
 #include "common/status.hpp"
 #include "common/types.hpp"
 
@@ -35,6 +36,10 @@ class DiskManager {
 
 	[[nodiscard]]
 	bool valid_page(page_id_t page_id);
+
+	[[nodiscard]]
+	Result<PageHeader> read_page_header(page_id_t page_id);
+	void write_page_header(std::span<std::byte, PAGE_HEADER_SIZE> page_header);
 
 	int fd_;
 	std::filesystem::path path_;

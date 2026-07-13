@@ -5,13 +5,16 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+#include <array>
 #include <cstddef>
 #include <expected>
 #include <filesystem>
 #include <format>
 #include <memory>
 #include <print>
+#include <span>
 
+#include "common/page_header.hpp"
 #include "common/status.hpp"
 #include "common/types.hpp"
 
@@ -91,4 +94,45 @@ Status DiskManager::WritePage(page_id_t page_id, std::span<const std::byte, PAGE
 	}
 
 	return Status::OK();
+}
+
+Result<page_id_t> DiskManager::AllocatePage() {
+	if (freelist_head_ != INVALID_PAGE) {
+		page_id_t free_page = freelist_head_;
+		auto ph = read_page_header(free_page);
+		if (ph.has_value()) {
+			if (ph.value().page_type != PageType::FREE) {
+				return std::unexpected(Status::Corruption(
+				    std::format("page {} on freelist has unexpected page_type", free_page)));
+			}
+			// update freelist_head
+			freelist_head_ = ph.value().next_page_id;
+			return free_page;
+		}
+		return std::unexpected(ph.error());
+	} else {
+		std::array<std::byte, PAGE_SIZE> empty_buf{};
+		if (pwrite(this->fd_, empty_buf.data(), PAGE_SIZE,
+		           static_cast<off_t>(page_count_ * PAGE_SIZE)) !=
+		    static_cast<ssize_t>(PAGE_SIZE)) {
+			return std::unexpected(Status::IOError("unable to allocate page"));
+		}
+		// TODO: Write Page as Free Page, since the zeroed page acts like PageType::META
+		return this->page_count_++;
+	}
+}
+
+Status DiskManager::DeallocatePage(page_id_t page_id) {}
+
+Result<PageHeader> DiskManager::read_page_header(page_id_t page_id) {
+	if (!valid_page(page_id)) {
+		return std::unexpected(Status::InvalidArgument("invalid page"));
+	}
+	std::array<std::byte, PAGE_HEADER_SIZE> buf;
+	ssize_t status = pread(this->fd_, buf.data(), PAGE_HEADER_SIZE, page_id * PAGE_SIZE);
+	if (status != static_cast<ssize_t>(PAGE_HEADER_SIZE)) {
+		return std::unexpected(Status::IOError("unable to read page header"));
+	}
+
+	return PageHeader::ReadFrom(buf);
 }
