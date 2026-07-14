@@ -24,6 +24,6 @@ struct RID {
 	bool isValid() const { return page_id != INVALID_PAGE; }
 };
 
-enum PageType : uint8_t { META, INDEX_INTERNAL, INDEX_LEAF, HEAP, FREE };
+enum class PageType : uint8_t { META, INDEX_INTERNAL, INDEX_LEAF, HEAP, FREE };
 
 }  // namespace kernsql

@@ -10,10 +10,13 @@
 #include <expected>
 #include <filesystem>
 #include <format>
+#include <iostream>
 #include <memory>
+#include <ostream>
 #include <print>
 #include <span>
 
+#include "common/logger.hpp"
 #include "common/page_header.hpp"
 #include "common/status.hpp"
 #include "common/types.hpp"
@@ -24,6 +27,7 @@ Result<std::unique_ptr<DiskManager>> DiskManager::Open(const std::filesystem::pa
 	int fd = open(path.c_str(), O_RDWR | O_CREAT, 0644);
 	// Fail fast if unable to open the file
 	if (fd < 0) {
+		LOG_DEBUG("failed to open file %s", path.c_str());
 		return std::unexpected(Status::Internal("unable to open file at path: " + path.string()));
 	}
 
@@ -31,6 +35,7 @@ Result<std::unique_ptr<DiskManager>> DiskManager::Open(const std::filesystem::pa
 	struct stat buf;
 	if (fstat(fd, &buf) < 0) {
 		close(fd);
+		LOG_DEBUG("failed to fstat file %s", path.c_str());
 		return std::unexpected(Status::Internal("unable to stat file at path: " + path.string()));
 	}
 	off_t file_size = buf.st_size;
@@ -38,12 +43,14 @@ Result<std::unique_ptr<DiskManager>> DiskManager::Open(const std::filesystem::pa
 	// file corrupted
 	if (file_size % static_cast<off_t>(PAGE_SIZE) != 0) {
 		close(fd);
+		LOG_DEBUG("file %s is corrupt", path.c_str());
 		return std::unexpected(
 		    Status::Corruption("the file at path " + path.string() + " is corrupt"));
 	}
 
 	page_id_t page_count = static_cast<page_id_t>(file_size / static_cast<off_t>(PAGE_SIZE));
 	auto dm = new DiskManager(fd, path, page_count);
+	LOG_INFO("Opening file %s", path.c_str());
 	return std::unique_ptr<DiskManager>(dm);
 }
 
@@ -52,7 +59,7 @@ DiskManager::DiskManager(int fd, std::filesystem::path path, page_id_t page_coun
 
 DiskManager::~DiskManager() {
 	close(this->fd_);
-	std::println("closed file at path: {}", this->path_.string());
+	LOG_DEBUG("closing file %s", this->path_.c_str());
 }
 
 Status DiskManager::Sync() {
