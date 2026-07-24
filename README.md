@@ -98,3 +98,7 @@ only moves through green pipelines.
 
 Standing on the shoulders of: *Database Internals* (Petrov) · *Designing Data-Intensive
 Applications* (Kleppmann) · CMU 15-445 · the PostgreSQL documentation and internals guides.
+
+## License
+
+[MIT](LICENSE) © 2026 Gaurav Kumar

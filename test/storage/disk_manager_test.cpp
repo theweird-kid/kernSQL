@@ -164,13 +164,52 @@ TEST_F(DiskManagerTest, OpenRejectsCorruptMetaPageType) {
 	// tests — DiskManager itself would never produce this on-disk state, so
 	// there's no way to reach it through the public API.
 
-	ASSERT_TRUE(false);
+	auto dm = DiskManager::Open(path_);
+	ASSERT_TRUE(dm.has_value());
+
+	dm->reset();
+
+	int fd = open(path_.c_str(), O_WRONLY);
+	ASSERT_GE(fd, 0);
+	PageHeader corrupt_header;
+	corrupt_header.page_type = PageType::HEAP;
+
+	std::array<std::byte, PAGE_HEADER_SIZE> meta_buf;
+	corrupt_header.WriteTo(meta_buf);
+
+	ASSERT_EQ(pwrite(fd, meta_buf.data(), PAGE_HEADER_SIZE, 0),
+	          static_cast<ssize_t>(PAGE_HEADER_SIZE));
+	fsync(fd);
+	close(fd);
+
+	dm = DiskManager::Open(path_);
+	ASSERT_EQ(dm.error().code(), Status::Corruption("doesn't matter, only comparing codes").code());
 }
 
 TEST_F(DiskManagerTest, OpenRejectsCorruptCatalogPageType) {
 	// Same idea, but corrupt the page_type byte at file offset PAGE_SIZE
 	// (the start of page 1's header) instead of page 0's.
-	ASSERT_TRUE(false);
+
+	auto dm = DiskManager::Open(path_);
+	ASSERT_TRUE(dm.has_value());
+
+	dm->reset();
+
+	int fd = open(path_.c_str(), O_WRONLY);
+	ASSERT_GE(fd, 0);
+	PageHeader corrupt_header;
+	corrupt_header.page_type = PageType::HEAP;
+
+	std::array<std::byte, PAGE_HEADER_SIZE> catalog_buf;
+	corrupt_header.WriteTo(catalog_buf);
+
+	ASSERT_EQ(pwrite(fd, catalog_buf.data(), PAGE_HEADER_SIZE, PAGE_SIZE),
+	          static_cast<ssize_t>(PAGE_HEADER_SIZE));
+	fsync(fd);
+	close(fd);
+
+	dm = DiskManager::Open(path_);
+	ASSERT_EQ(dm.error().code(), Status::Corruption("doesn't matter, only comparing codes").code());
 }
 
 // ---------------------------------------------------------------------------
@@ -180,12 +219,24 @@ TEST_F(DiskManagerTest, OpenRejectsCorruptCatalogPageType) {
 TEST_F(DiskManagerTest, ReadPageRejectsMetaPage) {
 	// ReadPage(META_PAGE_ID, ...) -> expect !status.ok(), and probably check
 	// the specific error code (InvalidArgument) too.
-	ASSERT_TRUE(false);
+
+	auto dm = DiskManager::Open(path_);
+	ASSERT_TRUE(dm.has_value());
+
+	std::array<std::byte, PAGE_SIZE> out;
+	ASSERT_EQ(dm.value()->ReadPage(META_PAGE_ID, out).code(),
+	          Status::InvalidArgument("doesn't matter, only comparing codes").code());
 }
 
 TEST_F(DiskManagerTest, WritePageRejectsMetaPage) {
 	// WritePage(META_PAGE_ID, ...) -> expect !status.ok() (InvalidArgument).
-	ASSERT_TRUE(false);
+
+	auto dm = DiskManager::Open(path_);
+	ASSERT_TRUE(dm.has_value());
+
+	std::array<std::byte, PAGE_SIZE> in;
+	ASSERT_EQ(dm.value()->WritePage(META_PAGE_ID, in).code(),
+	          Status::InvalidArgument("doesn't matter, only comparing codes").code());
 }
 
 TEST_F(DiskManagerTest, ReadWritePageRoundTripsOnCatalogPage) {
@@ -194,13 +245,35 @@ TEST_F(DiskManagerTest, ReadWritePageRoundTripsOnCatalogPage) {
 	// ReadPage(CATALOG_ROOT_PAGE_ID, out) into a fresh buffer and compare.
 	// This is the test that proves the catalog layer can actually use its
 	// own reserved page.
-	ASSERT_TRUE(false);
+
+	auto dm = DiskManager::Open(path_);
+	ASSERT_TRUE(dm.has_value());
+
+	std::array<std::byte, PAGE_SIZE> catalog_buf;
+	ASSERT_TRUE(dm.value()->ReadPage(CATALOG_ROOT_PAGE_ID, catalog_buf).ok());
+
+	const char* text = "My Unique testing bytes";
+	std::memcpy(catalog_buf.data() + PAGE_HEADER_SIZE, text, strlen(text));
+	ASSERT_TRUE(dm.value()->WritePage(CATALOG_ROOT_PAGE_ID, catalog_buf).ok());
+
+	std::array<std::byte, PAGE_SIZE> fresh_buf;
+	ASSERT_TRUE(dm.value()->ReadPage(CATALOG_ROOT_PAGE_ID, fresh_buf).ok());
+	ASSERT_EQ(0, std::memcmp(catalog_buf.data(), fresh_buf.data(), PAGE_SIZE));
 }
 
 TEST_F(DiskManagerTest, ReadPageRejectsOutOfRangePageId) {
 	// Try a negative page_id and a page_id == PageCount() (one past the
 	// last valid page) — both should fail.
-	ASSERT_TRUE(false);
+
+	auto dm = DiskManager::Open(path_);
+	ASSERT_TRUE(dm.has_value());
+
+	std::array<std::byte, PAGE_SIZE> buf;
+	Status st = dm.value()->ReadPage(INVALID_PAGE, buf);
+	ASSERT_EQ(Status::InvalidArgument("doesn't matter").code(), st.code());
+
+	st = dm.value()->ReadPage(dm.value()->PageCount(), buf);
+	ASSERT_EQ(Status::InvalidArgument("doesn't matter").code(), st.code());
 }
 
 TEST_F(DiskManagerTest, WritePageRejectsOutOfRangePageId) {
