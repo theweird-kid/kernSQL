@@ -50,19 +50,43 @@ Result<std::unique_ptr<DiskManager>> DiskManager::Open(const std::filesystem::pa
 
 	if (page_count == 0) {
 		// brand new file: reserve page 0 as the meta/superblock page
-		std::array<std::byte, PAGE_SIZE> empty_buf{};
-		if (pwrite(fd, empty_buf.data(), PAGE_SIZE, 0) != static_cast<ssize_t>(PAGE_SIZE)) {
-			LOG_DEBUG("failed to initialize meta page for %s", path.c_str());
-			return std::unexpected(Status::IOError("unable to initialize meta page"));
+		Status st = dm->write_empty_page(META_PAGE_ID);
+		if (!st.ok()) {
+			return std::unexpected(st);
 		}
-		dm->page_count_ = 1;
+		// write meta page header
+		PageHeader meta_header;
+		meta_header.page_type = PageType::META;
+		st = dm->write_page_header(META_PAGE_ID, meta_header);
+		if (!st.ok()) {
+			LOG_DEBUG("failed to write meta page header for %s", path.c_str());
+			return std::unexpected(st);
+		}
 
+		// reserve page 1 as the catalog head page
+		st = dm->write_empty_page(CATALOG_ROOT_PAGE_ID);
+		if (!st.ok()) {
+			return std::unexpected(st);
+		}
+		// write catalog page header
+		PageHeader catalog_header;
+		catalog_header.page_type = PageType::CATALOG;
+		st = dm->write_page_header(CATALOG_ROOT_PAGE_ID, catalog_header);
+		if (!st.ok()) {
+			LOG_DEBUG("failed to write catalog page header for %s", path.c_str());
+			return std::unexpected(st);
+		}
+
+		// update page count
+		dm->page_count_ = 2;
+
+		// update freelist
 		Status write_status = dm->persist_freelist_head(INVALID_PAGE);
 		if (!write_status.ok()) {
 			LOG_DEBUG("failed to write meta page header for %s", path.c_str());
 			return std::unexpected(write_status);
 		}
-	} else {
+	} else if (page_count >= 2) {
 		// existing file: page 0 must be the meta page; recover freelist_head_ from it
 		auto meta = dm->read_page_header(META_PAGE_ID);
 		if (!meta.has_value()) {
@@ -73,7 +97,22 @@ Result<std::unique_ptr<DiskManager>> DiskManager::Open(const std::filesystem::pa
 			return std::unexpected(Status::Corruption("the file at path " + path.string() +
 			                                          " is corrupt: missing meta page"));
 		}
+
+		// validate catalog head page
+		auto catalog_page = dm->read_page_header(CATALOG_ROOT_PAGE_ID);
+		if (!catalog_page.has_value()) {
+			return std::unexpected(catalog_page.error());
+		}
+		if (catalog_page.value().page_type != PageType::CATALOG) {
+			LOG_DEBUG("file %s is corrupt: page 1 is not a catalog page", path.c_str());
+			return std::unexpected(Status::Corruption("the file at path " + path.string() +
+			                                          " is corrupt: missing catalog page"));
+		}
+
 		dm->freelist_head_ = meta.value().next_page_id;
+	} else {
+		LOG_DEBUG("db file corrupted!");
+		return std::unexpected(Status::Corruption("db file is corrputed"));
 	}
 
 	LOG_INFO("Opening file %s", path.c_str());
@@ -177,23 +216,28 @@ Result<page_id_t> DiskManager::AllocatePage() {
 		return free_page;
 	} else {
 		// Allocate NEW Page by extending the file
-		std::array<std::byte, PAGE_SIZE> empty_buf{};
-		if (pwrite(this->fd_, empty_buf.data(), PAGE_SIZE,
-		           static_cast<off_t>(page_count_ * PAGE_SIZE)) !=
-		    static_cast<ssize_t>(PAGE_SIZE)) {
-			return std::unexpected(Status::IOError("unable to allocate page"));
+		Status st = write_empty_page(page_count_);
+		if (!st.ok()) {
+			return std::unexpected(st);
 		}
 
-		Status write_status = write_page_header(page_count_, allocated_header);
-		if (!write_status.ok()) {
+		// Write Header
+		st = write_page_header(page_count_, allocated_header);
+		if (!st.ok()) {
 			LOG_DEBUG("failed to stamp allocated header for new page %d", page_count_);
-			return std::unexpected(write_status);
+			return std::unexpected(st);
 		}
 		return this->page_count_++;
 	}
 }
 
 Status DiskManager::DeallocatePage(page_id_t page_id) {
+	if (page_id == CATALOG_ROOT_PAGE_ID) {
+		LOG_DEBUG("Can't deallocate page %d: reserved catalog root page", page_id);
+		return Status::InvalidArgument(
+		    std::format("page {} is the reserved catalog root page and cannot be deallocated",
+		                page_id));
+	}
 	if (Status s = validate_page_access(page_id); !s.ok()) {
 		LOG_DEBUG("Can't deallocate page %d", page_id);
 		return s;
@@ -248,6 +292,16 @@ Status DiskManager::write_page_header(page_id_t page_id, const PageHeader& heade
 	if (pwrite(this->fd_, buf.data(), PAGE_HEADER_SIZE, static_cast<off_t>(page_id * PAGE_SIZE)) !=
 	    static_cast<ssize_t>(PAGE_HEADER_SIZE)) {
 		return Status::Internal(std::format("unable to write page header for page {}", page_id));
+	}
+	return Status::OK();
+}
+
+Status DiskManager::write_empty_page(page_id_t page_id) {
+	std::array<std::byte, PAGE_SIZE> empty_buf{};
+	if (pwrite(this->fd_, empty_buf.data(), PAGE_SIZE, static_cast<off_t>(page_id * PAGE_SIZE)) !=
+	    static_cast<ssize_t>(PAGE_SIZE)) {
+		LOG_DEBUG("failed to write empty page %d", page_id);
+		return Status::IOError(std::format("unable to write empty page {}", page_id));
 	}
 	return Status::OK();
 }
