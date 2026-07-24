@@ -234,9 +234,8 @@ Result<page_id_t> DiskManager::AllocatePage() {
 Status DiskManager::DeallocatePage(page_id_t page_id) {
 	if (page_id == CATALOG_ROOT_PAGE_ID) {
 		LOG_DEBUG("Can't deallocate page %d: reserved catalog root page", page_id);
-		return Status::InvalidArgument(
-		    std::format("page {} is the reserved catalog root page and cannot be deallocated",
-		                page_id));
+		return Status::InvalidArgument(std::format(
+		    "page {} is the reserved catalog root page and cannot be deallocated", page_id));
 	}
 	if (Status s = validate_page_access(page_id); !s.ok()) {
 		LOG_DEBUG("Can't deallocate page %d", page_id);
