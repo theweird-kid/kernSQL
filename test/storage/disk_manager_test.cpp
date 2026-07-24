@@ -278,7 +278,16 @@ TEST_F(DiskManagerTest, ReadPageRejectsOutOfRangePageId) {
 
 TEST_F(DiskManagerTest, WritePageRejectsOutOfRangePageId) {
 	// Same as above but for WritePage.
-	ASSERT_TRUE(false);
+
+	auto dm = DiskManager::Open(path_);
+	ASSERT_TRUE(dm.has_value());
+
+	std::array<std::byte, PAGE_SIZE> buf;
+	Status st = dm.value()->WritePage(INVALID_PAGE, buf);
+	ASSERT_EQ(Status::InvalidArgument("doesn't matter").code(), st.code());
+
+	st = dm.value()->WritePage(dm.value()->PageCount(), buf);
+	ASSERT_EQ(Status::InvalidArgument("doesn't matter").code(), st.code());
 }
 
 // ---------------------------------------------------------------------------
@@ -288,20 +297,49 @@ TEST_F(DiskManagerTest, WritePageRejectsOutOfRangePageId) {
 TEST_F(DiskManagerTest, FirstAllocateReturnsPageTwo) {
 	// On a fresh file, AllocatePage() -> expect the returned page_id == 2
 	// (never 0 or 1, both reserved).
-	ASSERT_TRUE(false);
+
+	auto dm = DiskManager::Open(path_);
+	ASSERT_TRUE(dm.has_value());
+
+	auto res = dm.value()->AllocatePage();
+	ASSERT_TRUE(res.has_value());
+
+	ASSERT_EQ(2, res.value());
 }
 
 TEST_F(DiskManagerTest, AllocatedPageHeaderIsStampedAllocated) {
 	// AllocatePage() -> id, then ReadPage(id, ...) and check the header's
 	// page_type == PageType::ALLOCATED — proves the caller never sees a
 	// page that could be mistaken for FREE or an uninitialized type.
-	ASSERT_TRUE(false);
+
+	auto dm = DiskManager::Open(path_);
+	ASSERT_TRUE(dm.has_value());
+
+	auto res = dm.value()->AllocatePage();
+	ASSERT_TRUE(res.has_value());
+
+	std::array<std::byte, PAGE_SIZE> buf;
+	ASSERT_TRUE(dm.value()->ReadPage(res.value(), buf).ok());
+
+	auto ph = PageHeader::ReadFrom(std::span(buf).first<PAGE_HEADER_SIZE>());
+	ASSERT_EQ(ph.page_type, PageType::ALLOCATED);
 }
 
 TEST_F(DiskManagerTest, SequentialAllocationsExtendFileInOrder) {
 	// Call AllocatePage() three times on a fresh file -> expect 2, 3, 4 in
 	// order, and PageCount() == 5 afterward.
-	ASSERT_TRUE(false);
+
+	auto dm = DiskManager::Open(path_);
+	ASSERT_TRUE(dm.has_value());
+
+	Result<page_id_t> res;
+	for (int exp = 2; exp <= 4; exp++) {
+		res = dm.value()->AllocatePage();
+		ASSERT_TRUE(res.has_value());
+		ASSERT_EQ(exp, res.value());
+	}
+
+	ASSERT_EQ(5, dm.value()->PageCount());
 }
 
 TEST_F(DiskManagerTest, AllocateReusesFreedPageBeforeExtending) {
@@ -309,7 +347,19 @@ TEST_F(DiskManagerTest, AllocateReusesFreedPageBeforeExtending) {
 	// Expect id_b == id_a, and PageCount() unchanged from before the second
 	// AllocatePage() call (proves the freelist was consulted before
 	// extending the file).
-	ASSERT_TRUE(false);
+
+	auto dm = DiskManager::Open(path_);
+	ASSERT_TRUE(dm.has_value());
+
+	auto res_1 = dm.value()->AllocatePage();
+	ASSERT_TRUE(res_1.has_value());
+
+	ASSERT_TRUE(dm.value()->DeallocatePage(res_1.value()).ok());
+
+	auto res_2 = dm.value()->AllocatePage();
+	ASSERT_TRUE(res_2.has_value());
+
+	ASSERT_EQ(res_1.value(), res_2.value());
 }
 
 // ---------------------------------------------------------------------------
@@ -318,14 +368,24 @@ TEST_F(DiskManagerTest, AllocateReusesFreedPageBeforeExtending) {
 
 TEST_F(DiskManagerTest, DeallocatePageRejectsMetaPage) {
 	// DeallocatePage(META_PAGE_ID) -> expect InvalidArgument.
-	ASSERT_TRUE(false);
+
+	auto dm = DiskManager::Open(path_);
+	ASSERT_TRUE(dm.has_value());
+
+	auto st = dm.value()->DeallocatePage(META_PAGE_ID);
+	ASSERT_EQ(Status::InvalidArgument("doesn't matter").code(), st.code());
 }
 
 TEST_F(DiskManagerTest, DeallocatePageRejectsCatalogRootPage) {
 	// DeallocatePage(CATALOG_ROOT_PAGE_ID) -> expect InvalidArgument. This
 	// is the one that used to silently succeed before the reservation check
 	// was added — worth a comment noting that's exactly what this guards.
-	ASSERT_TRUE(false);
+
+	auto dm = DiskManager::Open(path_);
+	ASSERT_TRUE(dm.has_value());
+
+	auto st = dm.value()->DeallocatePage(CATALOG_ROOT_PAGE_ID);
+	ASSERT_EQ(Status::InvalidArgument("doesn't matter").code(), st.code());
 }
 
 TEST_F(DiskManagerTest, DeallocatingAlreadyFreePageIsNoOp) {
@@ -333,12 +393,32 @@ TEST_F(DiskManagerTest, DeallocatingAlreadyFreePageIsNoOp) {
 	// should return OK(), and a following AllocatePage() should return id
 	// again (not skip past it, and not corrupt the freelist by linking it
 	// to itself).
-	ASSERT_TRUE(false);
+
+	auto dm = DiskManager::Open(path_);
+	ASSERT_TRUE(dm.has_value());
+
+	auto res_1 = dm.value()->AllocatePage();
+	ASSERT_TRUE(res_1.has_value());
+
+	auto st = Status::OK();
+	for (int it = 1; it <= 2; it++) {
+		st = dm.value()->DeallocatePage(res_1.value());
+		ASSERT_EQ(Status::OK().code(), st.code());
+	}
+
+	auto res_2 = dm.value()->AllocatePage();
+	ASSERT_TRUE(res_2.has_value());
+	ASSERT_EQ(res_1.value(), res_2.value());
 }
 
 TEST_F(DiskManagerTest, DeallocatePageRejectsOutOfRangePageId) {
 	// DeallocatePage on a page_id >= PageCount() -> expect InvalidArgument.
-	ASSERT_TRUE(false);
+
+	auto dm = DiskManager::Open(path_);
+	ASSERT_TRUE(dm.has_value());
+
+	auto st = dm.value()->DeallocatePage(4);
+	ASSERT_EQ(Status::InvalidArgument("doesn't matter").code(), st.code());
 }
 
 }  // namespace kernsql
