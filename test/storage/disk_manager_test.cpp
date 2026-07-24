@@ -356,10 +356,13 @@ TEST_F(DiskManagerTest, AllocateReusesFreedPageBeforeExtending) {
 
 	ASSERT_TRUE(dm.value()->DeallocatePage(res_1.value()).ok());
 
+	page_id_t count_before_reuse = dm.value()->PageCount();
+
 	auto res_2 = dm.value()->AllocatePage();
 	ASSERT_TRUE(res_2.has_value());
 
 	ASSERT_EQ(res_1.value(), res_2.value());
+	ASSERT_EQ(count_before_reuse, dm.value()->PageCount());
 }
 
 // ---------------------------------------------------------------------------
@@ -417,7 +420,7 @@ TEST_F(DiskManagerTest, DeallocatePageRejectsOutOfRangePageId) {
 	auto dm = DiskManager::Open(path_);
 	ASSERT_TRUE(dm.has_value());
 
-	auto st = dm.value()->DeallocatePage(4);
+	auto st = dm.value()->DeallocatePage(dm.value()->PageCount());
 	ASSERT_EQ(Status::InvalidArgument("doesn't matter").code(), st.code());
 }
 
