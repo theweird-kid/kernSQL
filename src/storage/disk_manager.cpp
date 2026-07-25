@@ -62,6 +62,9 @@ Result<std::unique_ptr<DiskManager>> DiskManager::Open(const std::filesystem::pa
 			LOG_DEBUG("failed to write meta page header for %s", path.c_str());
 			return std::unexpected(st);
 		}
+		// page 0 exists now — advance so write_empty_page/write_page_header will
+		// accept page 1 as a valid append target next
+		dm->page_count_ = 1;
 
 		// reserve page 1 as the catalog head page
 		st = dm->write_empty_page(CATALOG_ROOT_PAGE_ID);
@@ -136,6 +139,10 @@ Status DiskManager::Sync() {
 
 bool DiskManager::valid_page(page_id_t page_id) {
 	return page_id >= 0 && page_id < this->page_count_;
+}
+
+bool DiskManager::valid_write_target(page_id_t page_id) {
+	return page_id >= 0 && page_id <= this->page_count_;
 }
 
 Status DiskManager::validate_page_access(page_id_t page_id) {
@@ -277,7 +284,8 @@ Result<PageHeader> DiskManager::read_page_header(page_id_t page_id) {
 		return std::unexpected(Status::InvalidArgument("invalid page"));
 	}
 	std::array<std::byte, PAGE_HEADER_SIZE> buf;
-	ssize_t status = pread(this->fd_, buf.data(), PAGE_HEADER_SIZE, page_id * PAGE_SIZE);
+	ssize_t status =
+	    pread(this->fd_, buf.data(), PAGE_HEADER_SIZE, static_cast<off_t>(page_id * PAGE_SIZE));
 	if (status != static_cast<ssize_t>(PAGE_HEADER_SIZE)) {
 		return std::unexpected(Status::IOError("unable to read page header"));
 	}
@@ -286,6 +294,10 @@ Result<PageHeader> DiskManager::read_page_header(page_id_t page_id) {
 }
 
 Status DiskManager::write_page_header(page_id_t page_id, const PageHeader& header) {
+	if (!valid_write_target(page_id)) {
+		return Status::InvalidArgument(
+		    std::format("invalid page id {} for write, page id <= {}", page_id, this->page_count_));
+	}
 	std::array<std::byte, PAGE_HEADER_SIZE> buf;
 	header.WriteTo(buf);
 	if (pwrite(this->fd_, buf.data(), PAGE_HEADER_SIZE, static_cast<off_t>(page_id * PAGE_SIZE)) !=
@@ -296,6 +308,10 @@ Status DiskManager::write_page_header(page_id_t page_id, const PageHeader& heade
 }
 
 Status DiskManager::write_empty_page(page_id_t page_id) {
+	if (!valid_write_target(page_id)) {
+		return Status::InvalidArgument(
+		    std::format("invalid page id {} for write, page id <= {}", page_id, this->page_count_));
+	}
 	std::array<std::byte, PAGE_SIZE> empty_buf{};
 	if (pwrite(this->fd_, empty_buf.data(), PAGE_SIZE, static_cast<off_t>(page_id * PAGE_SIZE)) !=
 	    static_cast<ssize_t>(PAGE_SIZE)) {

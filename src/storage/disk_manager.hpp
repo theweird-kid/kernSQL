@@ -110,6 +110,14 @@ class DiskManager {
 	[[nodiscard]]
 	bool valid_page(page_id_t page_id);
 
+	// like valid_page, but also accepts page_id == page_count_ — the one-past-the-end
+	// slot AllocatePage/Open() write into when extending the file by exactly one page.
+	// Used by write_page_header/write_empty_page so a bad page_id (negative, or more
+	// than one page past the current end) can never silently pwrite into or past
+	// unrelated file content.
+	[[nodiscard]]
+	bool valid_write_target(page_id_t page_id);
+
 	// bounds check + rejects META_PAGE_ID; used by ReadPage/WritePage so callers can
 	// never access the reserved superblock directly. Deliberately does NOT reject
 	// CATALOG_ROOT_PAGE_ID — the catalog layer needs Read/Write access to its own

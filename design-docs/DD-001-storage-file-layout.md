@@ -21,7 +21,7 @@ This doc fixes:
 
 | Page(s) | Owner | Contents |
 |---|---|---|
-| Page 0 | `DiskManager` | Meta page: magic number, format version, `page_size`, `page_count`, `freelist_head` |
+| Page 0 | `DiskManager` | Meta page. Only field actually persisted today is `freelist_head`, stored in the page header's `next_page_id`; `page_size` and `page_count` are fixed/recomputed rather than stored (`page_count` = file size / `PAGE_SIZE` on every `Open()`). No magic number or format version is written yet — see Open Questions. |
 | Page 1 | Catalog (layer above storage) | Reserved root page. `DiskManager` guarantees it exists after `Open()`/init and never hands it out via `AllocatePage`; its contents are opaque to storage. |
 | Page 2+ | Freelist-managed | Handed out by `AllocatePage`, returned by `DeallocatePage`. Contents fully opaque to `DiskManager` — heap pages, index pages, or free pages depending on current owner. |
 
@@ -97,6 +97,10 @@ tuple bytes and update a slot's offset without invalidating any RID that points 
 
 ## Open questions
 
+- Whether page 0 should gain a magic number and format version. Today `Open()`'s
+  corruption check is only "page 0's `page_type` is `META`, page 1's is `CATALOG`" —
+  it can't distinguish a kernSQL file from some other page-aligned file that happens
+  to land on those two byte values, and can't detect a format version mismatch.
 - Whether index-node key storage is fixed-size (leveraging `VARCHAR(n)`'s declared bound) or
   uses a slotted variable-length format like heap pages — left to the B+tree design doc.
 - Whether internal (non-leaf) index nodes also carry a right-sibling `next_page_id` for
