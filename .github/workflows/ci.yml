@@ -2,6 +2,8 @@ name: ci
 on:
   push: { branches: [main] }
   pull_request:
+permissions:
+  contents: read
 jobs:
   sanitize:
     runs-on: ubuntu-24.04
@@ -24,3 +26,16 @@ jobs:
       - run: |
           sudo apt-get update && sudo apt-get install -y clang-format
           find src test -name '*.cpp' -o -name '*.h' | xargs clang-format --dry-run --Werror
+  source-list:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          missing=0
+          for f in $(git ls-files 'src/*.cpp'); do
+            if ! grep -qF "$f" CMakeLists.txt; then
+              echo "::error::$f is tracked but not referenced in CMakeLists.txt"
+              missing=1
+            fi
+          done
+          exit "$missing"
