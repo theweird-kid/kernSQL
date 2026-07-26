@@ -1,6 +1,6 @@
 # Buffer Pool Manager: Concurrency & Latching
 
-**Status:** Proposed
+**Status:** Accepted
 **Component:** `src/storage` (`BufferPoolManager`)
 
 ## Context
@@ -111,6 +111,15 @@ Two separate structures track two different populations of frames:
 
 The miss path checks the free list first, and only consults the replacer once it's empty.
 
+**Clock-sweep parameters:** `usage_count` caps at **3**. It only needs to be large enough to
+give a genuinely hot page a couple of extra sweeps of protection over a page touched once —
+pushing the cap higher just slows down how fast eviction finds a victim under memory pressure,
+without a corresponding hit-ratio benefit once a page's `usage_count` has already saturated.
+The sweep uses one **global** clock hand, not one per page-table shard: the replacer is only
+touched on the miss path and on pin-count transitions, not on every access (see Non-goals), so
+it doesn't experience the per-access contention that motivated sharding the *page table*.
+Revisit only if profiling shows the replacer lock itself as a bottleneck.
+
 ## Page table sharding
 
 - **Shard count**: a small fixed power of two (e.g. 16) rather than derived from core count at
@@ -187,15 +196,26 @@ Still holding the shard lock:
 
 - **NewPage** — same frame-acquisition path as a miss, but calls `DiskManager::AllocatePage`
   instead of reading; there's nothing on disk yet to read.
-- **DeletePage** — rejects if `pin_count != 0`. Otherwise `DiskManager::DeallocatePage`, remove
-  the page-table entry, reset frame metadata, return the frame to the **free list** (not the
-  replacer — it holds no content worth tracking as an eviction candidate).
+- **DeletePage** — rejects if `pin_count != 0`. Otherwise: acquire the replacer lock and remove
+  the frame from the candidate set — it's in there, since `pin_count == 0` means the last
+  `UnpinPage` already made it evictable — re-verifying `pin_count == 0` under the frame's
+  metadata mutex while still holding the replacer lock, the same order eviction itself uses.
+  This closes a race where a concurrent `FetchPage` miss's `Evict()` could otherwise select this
+  exact frame as a victim at the same moment it's being deleted, handing two threads the same
+  `frame_id`. Only then: `DiskManager::DeallocatePage`, remove the page-table entry, reset frame
+  metadata, and return the frame to the **free list** (not back to the replacer — it holds no
+  content worth tracking as an eviction candidate anymore).
 - **UnpinPage** — decrement `pin_count` (guard against underflow); OR the caller's `is_dirty`
   into the frame's flag rather than overwrite it, since two concurrent pinners — one clean, one
   dirty — must leave the frame dirty. At `pin_count == 0`, mark the frame evictable (after
   releasing the metadata mutex, per the ordering fix).
 - **FlushPage / FlushAllPages** — shared content latch (a flush is just another reader),
-  `DiskManager::WritePage`, clear the dirty flag under the metadata mutex.
+  `DiskManager::WritePage`, clear the dirty flag under the metadata mutex. `FlushAllPages` is a
+  sequential loop over resident frames calling the same per-frame path — **best-effort, not
+  atomic across frames**. Nothing above the buffer pool needs cross-frame flush atomicity yet:
+  there's no WAL/checkpoint layer to coordinate with, and the crash-safety guarantee this
+  codebase targets (surviving `kill -9`, not power loss — see [DD-001](./DD-001-storage-file-layout.md))
+  doesn't demand it either. Revisit if/when a checkpoint protocol is designed.
 
 ## Non-goals (this iteration)
 
@@ -206,11 +226,3 @@ Still holding the shard lock:
 - Sharding the free list or replacer themselves — both are single global structures behind one
   lock each. Acceptable for now since they're only touched on the miss path and on pin-count
   transitions, not on every access; revisit only if measurement shows contention there.
-
-## Open questions
-
-- `usage_count` max value for the clock sweep.
-- Single global clock hand vs. one per page-table shard, if replacer-lock contention ever
-  shows up in practice.
-- `BufferPoolManager` public API surface beyond the five operations above (e.g. whether
-  `FlushAllPages` is transactional/atomic across frames, or best-effort).

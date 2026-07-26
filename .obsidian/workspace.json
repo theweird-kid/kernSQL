@@ -4,11 +4,11 @@
     "type": "split",
     "children": [
       {
-        "id": "19615ae5e5dc0062",
+        "id": "f8b803ce0789e6ab",
         "type": "tabs",
         "children": [
           {
-            "id": "b27174596c7c49e7",
+            "id": "213624f19b44c94b",
             "type": "leaf",
             "state": {
               "type": "markdown",
@@ -184,22 +184,27 @@
       "bases:Create new base": false
     }
   },
-  "active": "b27174596c7c49e7",
+  "active": "213624f19b44c94b",
   "lastOpenFiles": [
+    "src/buffer/freelist.hpp.tmp.8092.8ee4705f3206",
+    "src/buffer/freelist.hpp",
+    "src/buffer/frame.hpp.tmp.8092.b82eadbee8c7",
+    "src/buffer/frame.hpp",
+    "design-docs/DD-002-buffer-pool-manager.md.tmp.8092.8313099e083e",
+    "design-docs/DD-002-buffer-pool-manager.md.tmp.8092.af887d014ff6",
+    "design-docs/DD-002-buffer-pool-manager.md.tmp.8092.b48d22c38163",
+    "design-docs/DD-002-buffer-pool-manager.md.tmp.8092.d0f7cc78dec5",
     "design-docs/DD-002-buffer-manager.md",
+    "design-docs/notes/Buffer-Pool-Manager.md",
+    "design-docs.md",
+    "build/asan/_deps/googletest-src/docs/reference/assertions.md",
+    "design-docs/notes/Concurrency-Control.md",
+    "design-docs/notes/Buffer-Pool-Manager.md.tmp.8092.7df2c6fe0c17",
     "design-docs/DD-002-buffer-pool-manager.md",
+    "design-docs/notes/Concurrency-Control.md.tmp.8092.a8d049fc8659",
     "design-docs/DD-002-buffer-pool-manager.md.tmp.10562.eead1bd69bbb",
-    "design-docs/DD-002-buffer-pool-manager.md.tmp.10562.dcbfdfdd881a",
     "design-docs/notes/Indexes.md",
     "design-docs/DD-001-storage-file-layout.md",
-    "build/debug/Testing/Temporary/CTestCheckpoint.txt",
-    "build/debug/Testing/Temporary/LastTest.log.tmp",
-    "build/debug/CMakeFiles/disk_manager_test.dir/link.d",
-    "build/debug/CMakeFiles/disk_manager_test.dir/test/storage/disk_manager_test.cpp.o.d",
-    "test/storage/disk_manager_test.cpp.tmp.9657.43c7f8735f29",
-    "test/storage/disk_manager_test.cpp.tmp.9657.bdd712030b93",
-    "build/debug/CMakeFiles/kernsql.dir/link.d",
-    "build/debug/stu9JUzF",
     "assets/slotted_page.png",
     "assets/storage_file_layout.png",
     "Untitled.canvas",
