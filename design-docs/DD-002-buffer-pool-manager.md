@@ -89,9 +89,12 @@ Six independent mechanisms, each sized to the critical section it protects:
 5. **Free list lock** — a plain mutex guarding the free-list stack itself (see below). Short
    critical section (push/pop one `frame_id`), touched only on the miss path.
 
-6. **Replacer lock** — a plain mutex guarding the replacer's internal bookkeeping (clock hand
-   position, per-frame `usage_count`, candidate membership). Also only touched on the miss path
-   and on pin-count transitions, not on every access.
+6. **Replacer lock** — a plain mutex guarding the clock hand position and candidate
+   membership only. Per-frame `usage_count` deliberately lives *outside* this lock, as an
+   array of `std::atomic<uint8_t>`: `RecordAccess` bumps it with a capped CAS loop under
+   relaxed memory ordering (it's a heuristic counter — nothing synchronizes-with it). The
+   per-access hot path is therefore lock-free, and the mutex itself is only taken on the miss
+   path and on pin-count transitions.
 
 ## Free list vs. replacer
 
@@ -109,16 +112,43 @@ Two separate structures track two different populations of frames:
   as it passes them and returning the first one found at zero. Returns `nullopt` if nothing is
   evictable (every resident frame pinned) — the trigger for `BufferPoolFull`.
 
+  Two interface contracts, frozen here so the implementation has no open questions:
+
+  - `SetEvictable` is **idempotent**: it adjusts the internal evictable count only when the
+    frame's flag actually flips. A repeated `SetEvictable(fid, true)` must not inflate the
+    count, or `Evict`'s emptiness check lies.
+  - `Evict` **cleans up its victim itself**: the returned frame leaves the candidate set and
+    its `usage_count` resets to 0 before `Evict` returns, all under the replacer lock. The
+    miss path's subsequent `RecordAccess` seeds the incoming page's first count. Without
+    this, there'd be a window where a second concurrent `Evict` selects the same victim, and
+    the caller would owe a redundant `SetEvictable(fid, false)` after every eviction.
+
+  All three methods assert `frame_id < capacity` — same asserts-for-protocol-invariants
+  discipline as the page table, catching a bad frame_id loudly instead of indexing garbage.
+
 The miss path checks the free list first, and only consults the replacer once it's empty.
 
 **Clock-sweep parameters:** `usage_count` caps at **3**. It only needs to be large enough to
 give a genuinely hot page a couple of extra sweeps of protection over a page touched once —
 pushing the cap higher just slows down how fast eviction finds a victim under memory pressure,
 without a corresponding hit-ratio benefit once a page's `usage_count` has already saturated.
-The sweep uses one **global** clock hand, not one per page-table shard: the replacer is only
-touched on the miss path and on pin-count transitions, not on every access (see Non-goals), so
-it doesn't experience the per-access contention that motivated sharding the *page table*.
-Revisit only if profiling shows the replacer lock itself as a bottleneck.
+The sweep uses one **global** clock hand, not one per page-table shard: the per-access traffic
+(`RecordAccess`) is lock-free atomic bumps that never touch the replacer mutex (see
+Synchronization primitives, #6), so the mutex the hand lives behind is only contended on the
+miss path and on pin-count transitions — not the per-access contention that motivated sharding
+the *page table*. Revisit only if profiling shows the replacer lock itself as a bottleneck.
+
+**Sweep semantics:** the hand passes over *evictable* frames only — a non-evictable frame is
+skipped without touching its `usage_count`; its history is preserved for when it's unpinned
+again. Sweep decrements race with concurrent `RecordAccess` bumps; that's accepted — the
+clock is a heuristic, and a lost update in either direction is harmless. One consequence is
+that the textbook termination argument ("a zero must appear within cap+1 laps") is no longer
+airtight: a candidate could in principle be re-bumped as fast as the hand decrements it. So
+`Evict` is made deterministic by construction instead: it returns `nullopt` immediately when
+the evictable count is zero, and otherwise hard-bounds the sweep at
+`(kMaxUsageCount + 1) × capacity` positions, after which it evicts the first evictable frame
+regardless of count. In practice the bound is never hit; it exists so termination is a
+guarantee, not a probability.
 
 ## Page table sharding
 
@@ -224,5 +254,7 @@ Still holding the shard lock:
 - Async I/O (io_uring) replacing the loading-flag/condvar path.
 - NUMA-aware frame placement or partition affinity.
 - Sharding the free list or replacer themselves — both are single global structures behind one
-  lock each. Acceptable for now since they're only touched on the miss path and on pin-count
-  transitions, not on every access; revisit only if measurement shows contention there.
+  lock each. Acceptable for now: those locks are only taken on the miss path and on pin-count
+  transitions, while the replacer's per-access traffic (`RecordAccess`) bypasses its lock
+  entirely via atomic counters (see Synchronization primitives, #6); revisit only if
+  measurement shows contention there.
