@@ -6,12 +6,15 @@
 #include <unistd.h>
 
 #include <array>
+#include <cerrno>
 #include <cstddef>
 #include <expected>
 #include <filesystem>
 #include <format>
 #include <memory>
+#include <mutex>
 #include <span>
+#include <system_error>
 
 #include "common/logger.hpp"
 #include "common/page_header.hpp"
@@ -49,7 +52,16 @@ Result<std::unique_ptr<DiskManager>> DiskManager::Open(const std::filesystem::pa
 	auto dm = std::unique_ptr<DiskManager>(new DiskManager(fd, path, page_count));
 
 	if (page_count == 0) {
-		// brand new file: reserve page 0 as the meta/superblock page
+		// Brand-new file: reserve page 0 as the meta/superblock page.
+		//
+		// Every early return in this branch leaves a partially initialized file on
+		// disk — one page long, or two pages with no freelist head persisted. The
+		// next Open() sees page_count == 1 and reports Corruption rather than
+		// silently repairing it. That is a deliberate v1 decision, not an oversight:
+		// unwinding correctly would mean either unlinking a file the caller may not
+		// have wanted us to delete, or a bootstrap-recovery path, and both are the
+		// job of the WAL that does not exist yet. Crash-during-create is
+		// unrecoverable-by-design until then; the file is safe to delete by hand.
 		Status st = dm->write_empty_page(META_PAGE_ID);
 		if (!st.ok()) {
 			return std::unexpected(st);
@@ -152,7 +164,7 @@ Status DiskManager::validate_page_access(page_id_t page_id) {
 	}
 	if (!valid_page(page_id)) {
 		return Status::InvalidArgument(
-		    std::format("invalid page id {}, page id < {}", page_id, this->page_count_));
+		    std::format("invalid page id {}, page id < {}", page_id, this->page_count_.load()));
 	}
 	return Status::OK();
 }
@@ -162,13 +174,10 @@ Status DiskManager::ReadPage(page_id_t page_id, std::span<std::byte, PAGE_SIZE> 
 		return s;
 	}
 
-	ssize_t status =
-	    pread(this->fd_, out.data(), PAGE_SIZE, static_cast<off_t>(page_id * PAGE_SIZE));
-	if (status != static_cast<ssize_t>(PAGE_SIZE)) {
-		return Status::IOError("failed to read page");
-	}
-
-	return Status::OK();
+	// No latch: pread is atomic per call with respect to the file offset, and the
+	// bounds check above reads an atomic page_count_. Two callers touching the same
+	// page is the buffer pool's problem, not ours.
+	return full_read(PageOffset(page_id), out);
 }
 
 Status DiskManager::WritePage(page_id_t page_id, std::span<const std::byte, PAGE_SIZE> in) {
@@ -176,16 +185,17 @@ Status DiskManager::WritePage(page_id_t page_id, std::span<const std::byte, PAGE
 		return s;
 	}
 
-	ssize_t status =
-	    pwrite(this->fd_, in.data(), PAGE_SIZE, static_cast<off_t>(page_id * PAGE_SIZE));
-	if (status != static_cast<ssize_t>(PAGE_SIZE)) {
-		return Status::IOError("failed to write to page");
-	}
-
-	return Status::OK();
+	// Latch-free for the same reason as ReadPage.
+	return full_write(PageOffset(page_id), in);
 }
 
 Result<page_id_t> DiskManager::AllocatePage() {
+	// Held for the whole operation, not just the freelist_head_ store: the read of
+	// the head, the walk to its successor, the page-0 persist and the local update
+	// have to be one indivisible step, or two allocators both read the same head and
+	// both hand it out.
+	std::scoped_lock lock(this->meta_latch_);
+
 	PageHeader allocated_header;
 	allocated_header.page_type = PageType::ALLOCATED;
 	allocated_header.next_page_id = INVALID_PAGE;
@@ -223,22 +233,40 @@ Result<page_id_t> DiskManager::AllocatePage() {
 		return free_page;
 	} else {
 		// Allocate NEW Page by extending the file
-		Status st = write_empty_page(page_count_);
+		page_id_t new_page = this->page_count_;
+
+		Status st = write_empty_page(new_page);
 		if (!st.ok()) {
 			return std::unexpected(st);
 		}
 
 		// Write Header
-		st = write_page_header(page_count_, allocated_header);
+		st = write_page_header(new_page, allocated_header);
 		if (!st.ok()) {
-			LOG_DEBUG("failed to stamp allocated header for new page %d", page_count_);
+			LOG_DEBUG("failed to stamp allocated header for new page %d", new_page);
 			return std::unexpected(st);
 		}
-		return this->page_count_++;
+
+		// Publish last. Until this store lands the page fails valid_page(), so a
+		// concurrent ReadPage cannot observe a page whose header has not been
+		// stamped yet — and an error on either write above leaves page_count_
+		// untouched, so the half-written slot is simply retried by the next
+		// allocation rather than becoming visible.
+		this->page_count_ = new_page + 1;
+		return new_page;
 	}
 }
 
 Status DiskManager::DeallocatePage(page_id_t page_id) {
+	// Taken before the already-FREE check below, not after it. That check is a read
+	// of on-disk state that the rest of this function then acts on, so it is the
+	// start of the read-modify-write, not a precondition outside it: two concurrent
+	// deallocations of the same page would otherwise both observe a non-FREE header,
+	// both proceed, and thread the page onto the freelist twice. The result is a
+	// cycle in the chain, which does not fail here — it fails much later as an
+	// allocation loop that returns the same page forever.
+	std::scoped_lock lock(this->meta_latch_);
+
 	if (page_id == CATALOG_ROOT_PAGE_ID) {
 		LOG_DEBUG("Can't deallocate page %d: reserved catalog root page", page_id);
 		return Status::InvalidArgument(std::format(
@@ -284,10 +312,8 @@ Result<PageHeader> DiskManager::read_page_header(page_id_t page_id) {
 		return std::unexpected(Status::InvalidArgument("invalid page"));
 	}
 	std::array<std::byte, PAGE_HEADER_SIZE> buf;
-	ssize_t status =
-	    pread(this->fd_, buf.data(), PAGE_HEADER_SIZE, static_cast<off_t>(page_id * PAGE_SIZE));
-	if (status != static_cast<ssize_t>(PAGE_HEADER_SIZE)) {
-		return std::unexpected(Status::IOError("unable to read page header"));
+	if (Status s = full_read(PageOffset(page_id), buf); !s.ok()) {
+		return std::unexpected(s);
 	}
 
 	return PageHeader::ReadFrom(buf);
@@ -296,13 +322,13 @@ Result<PageHeader> DiskManager::read_page_header(page_id_t page_id) {
 Status DiskManager::write_page_header(page_id_t page_id, const PageHeader& header) {
 	if (!valid_write_target(page_id)) {
 		return Status::InvalidArgument(
-		    std::format("invalid page id {} for write, page id <= {}", page_id, this->page_count_));
+		    std::format("invalid page id {} for write, page id <= {}", page_id, this->page_count_.load()));
 	}
 	std::array<std::byte, PAGE_HEADER_SIZE> buf;
 	header.WriteTo(buf);
-	if (pwrite(this->fd_, buf.data(), PAGE_HEADER_SIZE, static_cast<off_t>(page_id * PAGE_SIZE)) !=
-	    static_cast<ssize_t>(PAGE_HEADER_SIZE)) {
-		return Status::Internal(std::format("unable to write page header for page {}", page_id));
+	if (Status s = full_write(PageOffset(page_id), buf); !s.ok()) {
+		LOG_DEBUG("failed to write page header for page %d", page_id);
+		return s;
 	}
 	return Status::OK();
 }
@@ -310,13 +336,12 @@ Status DiskManager::write_page_header(page_id_t page_id, const PageHeader& heade
 Status DiskManager::write_empty_page(page_id_t page_id) {
 	if (!valid_write_target(page_id)) {
 		return Status::InvalidArgument(
-		    std::format("invalid page id {} for write, page id <= {}", page_id, this->page_count_));
+		    std::format("invalid page id {} for write, page id <= {}", page_id, this->page_count_.load()));
 	}
 	std::array<std::byte, PAGE_SIZE> empty_buf{};
-	if (pwrite(this->fd_, empty_buf.data(), PAGE_SIZE, static_cast<off_t>(page_id * PAGE_SIZE)) !=
-	    static_cast<ssize_t>(PAGE_SIZE)) {
+	if (Status s = full_write(PageOffset(page_id), empty_buf); !s.ok()) {
 		LOG_DEBUG("failed to write empty page %d", page_id);
-		return Status::IOError(std::format("unable to write empty page {}", page_id));
+		return s;
 	}
 	return Status::OK();
 }
@@ -330,5 +355,53 @@ Status DiskManager::persist_freelist_head(page_id_t new_head) {
 }
 
 page_id_t DiskManager::PageCount() const {
-	return page_count_;
+	// No latch needed: page_count_ is atomic precisely so this and the bounds checks
+	// on the ReadPage/WritePage path stay off meta_latch_.
+	return page_count_.load();
+}
+
+Status DiskManager::full_write(off_t off, std::span<const std::byte> buf) {
+	std::size_t done = 0;
+	while (done < buf.size()) {
+		ssize_t n =
+		    pwrite(this->fd_, buf.data() + done, buf.size() - done, off + static_cast<off_t>(done));
+		if (n < 0) {
+			// Capture errno before anything else can clobber it — std::format and
+			// Status construction are both allowed to make library calls.
+			int err = errno;
+			if (err == EINTR) continue;
+			return Status::IOError(std::format("pwrite at offset {} failed after {} of {} bytes: {}",
+			                                   off, done, buf.size(),
+			                                   std::system_category().message(err)));
+		}
+		done += static_cast<std::size_t>(n);
+	}
+	return Status::OK();
+}
+
+Status DiskManager::full_read(off_t off, std::span<std::byte> buf) {
+	std::size_t done = 0;
+	while (done < buf.size()) {
+		ssize_t n =
+		    pread(this->fd_, buf.data() + done, buf.size() - done, off + static_cast<off_t>(done));
+		if (n < 0) {
+			int err = errno;
+			if (err == EINTR) continue;
+			return Status::IOError(std::format("pread at offset {} failed after {} of {} bytes: {}",
+			                                   off, done, buf.size(),
+			                                   std::system_category().message(err)));
+		}
+		if (n == 0) {
+			// EOF with bytes still outstanding. Unlike a short read this is terminal:
+			// the file is shorter than the caller's bounds check believed, so looping
+			// would never make progress. Corruption rather than IOError — nothing
+			// went wrong at the syscall level, the file is simply not the size the
+			// page count says it is.
+			return Status::Corruption(
+			    std::format("unexpected EOF at offset {}: wanted {} bytes, got {}", off, buf.size(),
+			                done));
+		}
+		done += static_cast<std::size_t>(n);
+	}
+	return Status::OK();
 }
