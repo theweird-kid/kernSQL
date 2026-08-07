@@ -1,260 +1,264 @@
 # Buffer Pool Manager: Concurrency & Latching
 
 **Status:** Accepted
-**Component:** `src/storage` (`BufferPoolManager`)
+**Component:** `src/buffer` (`BufferPoolManager`)
 
-## Context
+Caches a fixed number of `PAGE_SIZE` pages from `DiskManager` ([DD-001](./DD-001-storage-file-layout.md))
+as **frames**, and is what the catalog, heap and index use instead of `DiskManager` directly.
+`DiskManager`'s `ReadPage`/`WritePage` are safe to call concurrently but provide no exclusion
+between two callers on the *same* page; that is this layer's job.
 
-`DiskManager` (see [DD-001](./DD-001-storage-file-layout.md)) owns raw page I/O and allocation
-but is explicitly not thread-safe — its own header comments defer "concurrency control
-(per-page latching)" to "one layer up." `BufferPoolManager` is that layer: it caches a fixed
-number of `PAGE_SIZE` pages in memory as **frames**, and is the component everything above
-(catalog, heap, index) actually talks to instead of touching `DiskManager` directly.
+## The rule everything follows
 
-Target: throughput comparable to commercial engines (PostgreSQL/InnoDB-class), not the
-textbook-simplest implementation, but also not bleeding-edge (lock-free/RCU, io_uring-driven
-async I/O) — that level of complexity isn't justified for this goal.
+> **No lock is held across an I/O operation, and a frame's identity — which page it holds —
+> changes only inside a single critical section that performs no I/O.**
 
-## Why not a single mutex per frame
+## Frame lifecycle
 
-An OS mutex (`std::mutex`/futex) is cheap uncontended, but on contention the losing thread
-sleeps until the kernel wakes it — with no awareness that the critical section it's waiting on
-might be a handful of instructions. For latches (short-duration, protect physical in-memory
-structures, no deadlock detection — as opposed to locks, which are long-duration and protect
-logical/transactional state), that mismatch produces convoys: threads queue up and get woken
-in scheduler order while the actual protected work is nearly free. A single latch per frame
-also conflates two things with very different hold times — a pin-count check (nanoseconds)
-and a page scan (potentially milliseconds) — so one blocks the other unnecessarily.
+One `enum class FrameState` per frame, under the frame's metadata mutex.
 
-PostgreSQL's shared buffer design (see `src/backend/storage/buffer/README` upstream) solves
-this by splitting responsibilities into independent mechanisms sized to what they protect,
-rather than one lock per buffer. Consolidated below is kernSQL's version of that split.
+| State      | Mapped | Contents    | Pin count | In replacer          |
+|------------|--------|-------------|-----------|----------------------|
+| `Free`     | no     | meaningless | 0         | no (on free list)    |
+| `Loading`  | yes    | meaningless | ≥ 1       | no                   |
+| `Resident` | yes    | valid       | ≥ 0       | iff `pin_count == 0` |
+| `Failed`   | no     | meaningless | ≥ 1       | no                   |
 
-## Frame structure
+| Transition          | Owner                                                          |
+|---------------------|----------------------------------------------------------------|
+| `Free → Loading`    | a fetch miss, under the new page's shard lock                   |
+| `Loading → Resident`| the loader, on a successful read; notifies waiters              |
+| `Loading → Failed`  | the loader, on a read error; erases the mapping first           |
+| `Failed → Free`     | the loader only, once waiters have dropped their pins           |
+| `Free → Resident`   | `NewPage` — nothing on disk to read, so no `Loading` phase      |
+| `Resident → Free`   | reclaim or `DeletePage`; requires unpinned and clean            |
 
-Each `Frame` owns:
+There is no `Reclaiming` state: reclaim performs no I/O, so it is one critical section and nothing
+can need to cancel it.
 
-- Its `PAGE_SIZE` content buffer, embedded inline rather than behind a pointer — the whole
-  pool is one contiguous allocation of `capacity × sizeof(Frame)`, made once at
-  `BufferPoolManager` construction. Better cache locality than one allocation per frame, and
-  required anyway: once a frame owns a mutex and a condition variable (see below), it is
-  neither copyable nor movable, so it has to live in storage that's sized once and never
-  reallocated.
-- `page_id_t page_id` — which page this frame currently holds (`INVALID_PAGE` if unused).
-- `pin_count` — evictable only at zero.
-- `is_dirty` — modified since last flush.
-- `loading` — true while a disk read for this frame is in flight; distinct from `is_dirty`,
-  gates whether the frame's content is safe to hand out yet.
-- The frame's own metadata mutex and condition variable (see Synchronization primitives, #2).
-- The frame's own content latch (see #1).
+## Frame fields
 
-Deliberately **not** stored on `Frame`:
+`page_id`, `state`, `pin_count`, the inline `PAGE_SIZE` buffer, `dirty_epoch`/`flushed_epoch`, a
+metadata mutex + condition variable, and a content latch.
 
-- `frame_id` — purely positional (the frame's index in the pool array). Redundant once frames
-  live in a fixed contiguous array, and a stored copy risks drifting out of sync.
-- `page_lsn` — a WAL-recovery concern; nothing reads or writes a WAL yet, so caching it here
-  would be a field nothing uses. Revisit when recovery design starts.
-- `usage_count` — clock-sweep bookkeeping belongs to the **Replacer** (see below), not the
-  frame itself. This keeps `Frame`'s job narrowly "what page is this and how do I access it,"
-  and lets the replacer be a self-contained component indexed by `frame_id`.
+The pool is one contiguous allocation made once at construction — a frame owns a mutex and condvar,
+so it is neither copyable nor movable.
 
-## Synchronization primitives
+Not stored: `frame_id` (it is the array index), `page_lsn` (a WAL concern), `usage_count` (the
+replacer's).
 
-Six independent mechanisms, each sized to the critical section it protects:
+## Locks
 
-1. **Frame content latch** (reader/writer, one per frame) — protects the actual `PAGE_SIZE`
-   bytes. Shared mode for readers, exclusive for writers; can legitimately be held for the
-   duration of a caller's access (e.g. across a scan). Implemented as a hybrid spin-then-block
-   RW lock (à la Postgres's `LWLock`) rather than an OS `pthread_rwlock_t` directly, for control
-   over the wait/wake path and cheap uncontended acquisition.
+1. **Content latch** (per frame, reader/writer) — the page bytes. Held as long as a caller's access
+   needs. `std::shared_mutex` behind `Frame::AcquireRead`/`AcquireWrite`, which return `auto`-bound
+   locks so the type stays swappable.
+2. **Metadata mutex** (per frame) — `state`, `pin_count`, `page_id`. Must be a real mutex, not an
+   atomic word: `Loading` needs a condition variable to wait on.
+3. **Page-table shard locks** — the `page_id → frame_id` map split into 16 shards, keyed
+   `page_id & (N-1)`. Page ids are sequential, so low bits already spread evenly.
+4. **Free-list lock** — one mutex, one push or pop.
+5. **Replacer lock** — clock hand and candidate set only. `usage_count` is `std::atomic<uint8_t>[]`
+   outside it, bumped by a capped relaxed CAS, so the per-access path is lock-free.
 
-2. **Frame metadata mutex** (pin count, dirty flag, loading flag, current page_id) — a plain
-   `std::mutex`, one per frame, deliberately separate from the content latch so a long content
-   hold never blocks a quick "is this frame pinned?" check. This resolves what was an open
-   question (spinlock vs. atomic word): the `loading` flag needs a real `condition_variable` to
-   coordinate cache-miss waiters, and `condition_variable` requires a real mutex to pair with —
-   an atomic word can't wait/notify. A per-frame mutex only ever contends when multiple threads
-   hit that exact page simultaneously, a much narrower case than a shared bottleneck lock, so
-   this stays consistent with the "comparable to commercial" target.
+I/O coordination is not a lock: it is the `Loading` state plus the frame's condvar.
 
-3. **Page table shard locks** — the `page_id → frame_id` map is split into `N` shards
-   (`hash(page_id) % N`), each with its own lock, so lookups for unrelated pages never
-   serialize against each other.
+## The pin invariant
 
-4. **I/O coordination** — not a lock: the frame's `loading` flag plus its condition variable
-   (mechanism #2). The thread that misses first sets `loading`, issues the read, then clears it
-   and notifies waiters. A spin-or-short-block latch must never be held across a blocking
-   syscall — that's the one thing latches are specifically not for.
+> **No thread may read, write, wait on, or flush a frame's contents without holding a pin. Every
+> lock here is momentary; the pin is what spans.**
 
-5. **Free list lock** — a plain mutex guarding the free-list stack itself (see below). Short
-   critical section (push/pop one `frame_id`), touched only on the miss path.
+- A miss waiter **pins before** it sleeps on `Loading`, so `page_id` is provably unchanged across
+  the wait — no re-validation, no restart.
+- A flush **pins the frame it flushes**, or a concurrent miss repurposes it mid-writeback.
+- A reclaimer flushing a dirty victim **pins across the writeback** and re-validates after.
 
-6. **Replacer lock** — a plain mutex guarding the clock hand position and candidate
-   membership only. Per-frame `usage_count` deliberately lives *outside* this lock, as an
-   array of `std::atomic<uint8_t>`: `RecordAccess` bumps it with a capped CAS loop under
-   relaxed memory ordering (it's a heuristic counter — nothing synchronizes-with it). The
-   per-access hot path is therefore lock-free, and the mutex itself is only taken on the miss
-   path and on pin-count transitions.
+## Dirtiness
 
-## Free list vs. replacer
+Two monotonic `std::atomic<uint64_t>` counters outside every lock. `dirty_epoch` is bumped by each
+`WritePageGuard` release; `flushed_epoch` is raised by each completed flush. Dirty iff
+`dirty_epoch > flushed_epoch`. This keeps the content latch and metadata mutex from ever being held
+together.
 
-Two separate structures track two different populations of frames:
+**Flush sequence**, used by every flush path:
 
-- **Free list** — frame_ids that have never held a page, or were just vacated by
-  `DeletePage`. A LIFO stack, fully populated with every index at construction. Popping is O(1)
-  and touches nothing else — avoids running the clock sweep at all during warm-up, before the
-  pool is full.
-- **Replacer** — tracks eviction *candidates*: frames currently holding a page but unpinned. A
-  frame enters this set the instant its pin count drops to zero, and leaves the instant it's
-  pinned again. Interface: `RecordAccess(frame_id)` bumps `usage_count` (capped);
-  `SetEvictable(frame_id, bool)` adds/removes a frame from the candidate set;
-  `Evict() -> optional<frame_id>` runs the clock sweep, decrementing candidates' `usage_count`
-  as it passes them and returning the first one found at zero. Returns `nullopt` if nothing is
-  evictable (every resident frame pinned) — the trigger for `BufferPoolFull`.
+1. Acquire the shared content latch.
+2. Sample `D = dirty_epoch`.
+3. `DiskManager::WritePage`.
+4. Release the content latch.
+5. Raise `flushed_epoch` to `D` (CAS upward only).
 
-  Two interface contracts, frozen here so the implementation has no open questions:
+A writer that dirties after step 4 bumps past `D`, so the frame stays dirty; one cannot dirty
+between 1 and 4, which needs the exclusive latch. Never falsely clean.
 
-  - `SetEvictable` is **idempotent**: it adjusts the internal evictable count only when the
-    frame's flag actually flips. A repeated `SetEvictable(fid, true)` must not inflate the
-    count, or `Evict`'s emptiness check lies.
-  - `Evict` **cleans up its victim itself**: the returned frame leaves the candidate set and
-    its `usage_count` resets to 0 before `Evict` returns, all under the replacer lock. The
-    miss path's subsequent `RecordAccess` seeds the incoming page's first count. Without
-    this, there'd be a window where a second concurrent `Evict` selects the same victim, and
-    the caller would owe a redundant `SetEvictable(fid, false)` after every eviction.
+## Free list and replacer
 
-  All three methods assert `frame_id < capacity` — same asserts-for-protocol-invariants
-  discipline as the page table, catching a bad frame_id loudly instead of indexing garbage.
+- **Free list** — frame_ids in state `Free`. A LIFO stack behind a mutex, fully populated at
+  construction. No condvar, no exhausted flag, no watermarks; an empty list sends the caller to the
+  replacer.
+- **Replacer** — frames in `Resident` with `pin_count == 0`. `RecordAccess` bumps a capped
+  `usage_count`; `SetEvictable` adds/removes a candidate; `Evict()` sweeps and returns the first
+  candidate at zero, `nullopt` if none are evictable.
 
-The miss path checks the free list first, and only consults the replacer once it's empty.
+Frozen contracts:
 
-**Clock-sweep parameters:** `usage_count` caps at **3**. It only needs to be large enough to
-give a genuinely hot page a couple of extra sweeps of protection over a page touched once —
-pushing the cap higher just slows down how fast eviction finds a victim under memory pressure,
-without a corresponding hit-ratio benefit once a page's `usage_count` has already saturated.
-The sweep uses one **global** clock hand, not one per page-table shard: the per-access traffic
-(`RecordAccess`) is lock-free atomic bumps that never touch the replacer mutex (see
-Synchronization primitives, #6), so the mutex the hand lives behind is only contended on the
-miss path and on pin-count transitions — not the per-access contention that motivated sharding
-the *page table*. Revisit only if profiling shows the replacer lock itself as a bottleneck.
+- `SetEvictable` is **idempotent** — it adjusts the evictable count only when the flag actually
+  flips.
+- `Evict` **removes its victim from the candidate set itself** and resets its `usage_count`, under
+  the replacer lock.
+- A frame `Evict` returns that the caller declines to reclaim is **normal, not an error**; it stays
+  out of the candidate set until its next unpin.
 
-**Sweep semantics:** the hand passes over *evictable* frames only — a non-evictable frame is
-skipped without touching its `usage_count`; its history is preserved for when it's unpinned
-again. Sweep decrements race with concurrent `RecordAccess` bumps; that's accepted — the
-clock is a heuristic, and a lost update in either direction is harmless. One consequence is
-that the textbook termination argument ("a zero must appear within cap+1 laps") is no longer
-airtight: a candidate could in principle be re-bumped as fast as the hand decrements it. So
-`Evict` is made deterministic by construction instead: it returns `nullopt` immediately when
-the evictable count is zero, and otherwise hard-bounds the sweep at
-`(kMaxUsageCount + 1) × capacity` positions, after which it evicts the first evictable frame
-regardless of count. In practice the bound is never hit; it exists so termination is a
-guarantee, not a probability.
+**Clock parameters:** `usage_count` caps at 3. One global clock hand. `Evict` is bounded by
+construction — `nullopt` immediately when nothing is evictable, otherwise at most
+`(cap + 1) × capacity` positions, after which it takes the first evictable frame regardless of
+count.
 
-## Page table sharding
+## Reclaiming a frame
 
-- **Shard count**: a small fixed power of two (e.g. 16) rather than derived from core count at
-  runtime — simpler, no CPU-detection dependency, trivially bumped later if profiling shows
-  contention.
-- **Hash function**: a plain bitmask, `page_id & (N-1)`. `page_ids` are assigned sequentially
-  by `AllocatePage` (plus freelist reuse on disk), and consecutive integers' low bits already
-  cycle through every shard value evenly — no multiplicative/Fibonacci hashing needed for this
-  access pattern.
+A thread that needs a frame and finds the free list empty reclaims one inline, holding **no other
+lock** on entry.
+
+1. `Evict()` → victim, already out of the candidate set. `nullopt` → return `BufferPoolFull`.
+2. **Clean victim.** Take the victim's shard lock, then its metadata mutex. Re-validate:
+   `Resident`, `pin_count == 0`, `!IsDirty()`, mapping still points here. If so — erase the
+   mapping, set `page_id = INVALID_PAGE`, `state = Free`, reset epochs, release both. The frame is
+   now private to this thread. **No I/O in this section.**
+3. **Any check fails** — drop both locks, back to step 1 for another victim. Do not return it to
+   the replacer; whoever pinned it owes a `SetEvictable(true)` on release.
+4. **Dirty victim.** Under the metadata mutex verify `Resident` and `pin_count == 0`, take a pin,
+   note `page_id`, release everything, run the flush sequence, then retry from step 2 with
+   `pin_count == 1` (our own) as the condition. Drop the pin either way.
+
+Step 4 spans I/O and is safe because identity never changes during the flush: the mapping stays
+live, so a concurrent fetcher gets a cache hit and pins, and the reclaimer sees `pin_count > 1` at
+re-validation and moves on.
+
+The clean-check in step 2 is exact, not conservative: nothing can newly dirty the frame (that needs
+a guard, which needs the page table we hold the shard lock for), and nothing already dirtied is
+missed (a guard's release bumps `dirty_epoch` strictly before decrementing `pin_count`).
 
 ## Lock ordering
 
-Canonical global order, to prevent deadlock once a thread can hold more than one of the above
-at a time:
+> **The only two locks ever held at once are a page-table shard lock and a frame metadata mutex, in
+> that order. Enforce it as: never acquire a shard lock while holding a frame metadata mutex.**
 
-**page-table shard lock → free-list lock / replacer lock → frame metadata mutex → frame
-content latch.**
+Everything else is a leaf. The replacer lock is taken and dropped inside `Evict()`. The free-list
+lock covers one push or pop. Content latches are taken only after both others are released. No path
+needs two shard locks.
 
-Two corollaries fall out of this:
+Standing rules:
 
-- **Replacer/free-list calls must never be made while holding a frame's metadata mutex.**
-  Increment/decrement `pin_count` under the metadata mutex, note the transition (0→1 or 1→0),
-  release the metadata mutex, *then* call `RecordAccess`/`SetEvictable` if the transition
-  requires it. This is a real correction from the initial control-flow sketch, which had Fetch
-  and Unpin acquire the metadata mutex and then call into the replacer while still holding it —
-  that's backwards relative to eviction, which acquires the replacer lock first and then wants
-  the victim's metadata mutex. Two threads doing the mirror-image thing is a deadlock. The fix
-  accepts a small benign race (a frame briefly marked evictable while about to be re-pinned,
-  or vice versa) — harmless, because eviction re-validates `pin_count == 0` under the metadata
-  mutex before actually reusing a frame.
-- **Crossing two page-table shards** (eviction removing an old mapping while inserting a new
-  one in a different shard) is handled by dropping the currently-held shard lock, acquiring
-  both shards in ascending shard-index order, and re-checking that the target `page_id` is
-  still absent before proceeding — another thread may have inserted it while the lock was
-  released. If so, abandon the eviction attempt and fall back to the hit path.
+- **Never block on I/O or a condvar while holding a shard lock.** Both waits here — a miss waiter on
+  `Loading`, the loader on the failed-load path — drop it first.
+- **Never call into the replacer or free list while holding a frame's metadata mutex.** Note the
+  0→1 or 1→0 transition under the mutex, release it, *then* call `RecordAccess`/`SetEvictable`.
+  This admits a benign race (a frame briefly evictable while about to be re-pinned), harmless
+  because reclaim re-validates `pin_count == 0` before repurposing.
+- Any operation needing two content latches takes them in a globally fixed order, not a
+  caller-dependent one. State the order where that operation is designed.
 
-Any future operation needing more than one frame's content latch simultaneously must also
-acquire those in a fixed order (e.g. by `frame_id`), never in caller-dependent order.
+## Page guards
+
+RAII guards, never raw frames.
+
+```
+Result<ReadPageGuard>  FetchPageRead(page_id_t page_id);
+Result<WritePageGuard> FetchPageWrite(page_id_t page_id);
+Result<WritePageGuard> NewPage();
+```
+
+Latched from birth, in the mode the caller named. **No pin-only guard and no upgrade path**; a
+future optimistic B+tree descent must drop the guard, re-fetch for write, and re-validate.
+
+`ReadPageGuard` exposes `span<const byte, PAGE_SIZE>`; `WritePageGuard` also exposes a mutable
+span. `PageId()` returns a value **stored in the guard**, never read back from `Frame::page_id` —
+that field is under the metadata mutex.
+
+**Release sequence (frozen):**
+
+1. `WritePageGuard` only: bump `dirty_epoch`.
+2. Release the content latch.
+3. Metadata mutex; decrement `pin_count`; note a 1→0 transition.
+4. Release the metadata mutex.
+5. If it transitioned, `SetEvictable(frame_id, true)`.
+
+Step 1 precedes 2 so a flusher sees an epoch covering every write it is about to capture, and
+precedes 3 so a reclaimer's clean-check is exact. The frame cannot be reclaimed between 2 and 3 —
+the pin, not the latch, protects identity. `WritePageGuard` bumps the epoch **unconditionally**.
+
+**Value semantics:** non-copyable; movable, with the moved-from guard's manager pointer nulled and
+move-assignment releasing before taking over. `Drop()` is explicit and idempotent; the destructor
+calls it.
+
+`UnpinPage` is **private**; the guards are friends. Guards live in `page_guard.{hpp,cpp}` with
+`BufferPoolManager` forward-declared.
 
 ## Control flow
 
-### FetchPage(page_id) — hit path
+### FetchPage — hit
 
-1. Acquire the page-table shard lock for `page_id`; look up `frame_id`.
-2. Acquire the frame's metadata mutex. If `loading`, release the shard lock and wait on the
-   frame's condition variable until it clears — this is still a hit, just not yet ready.
-3. Increment `pin_count`; note if it transitioned 0→1. Release the metadata mutex, then (per
-   the ordering fix above) call `RecordAccess` and, if it transitioned, `SetEvictable(frame_id,
-   false)`.
-4. Release the shard lock, return the frame handle. The caller separately acquires the content
-   latch (shared or exclusive) for what it intends to do.
+1. Shard lock for `page_id`; look up `frame_id`.
+2. Metadata mutex. **Increment `pin_count` immediately**, before any wait. Note a 0→1 transition.
+3. Release the shard lock. If `Loading`, wait on the condvar. If `Failed`, decrement the pin,
+   notify, return the error.
+4. Release the metadata mutex, then `RecordAccess`, and `SetEvictable(false)` if it went 0→1.
+5. Acquire the content latch in the requested mode; return the guard.
 
-### FetchPage — miss path
+### FetchPage — miss
 
-Still holding the shard lock:
+**Release the shard lock first** — acquiring a frame may reclaim one, which needs the *victim's*
+shard lock.
 
-1. Get a frame: pop the free list, or ask the replacer to `Evict()`. If neither yields one,
-   release the shard lock and return `BufferPoolFull`.
-2. If the victim holds another page (`old_page_id`) whose shard differs from the current one:
-   drop the current shard lock, acquire both shards in ascending order, and re-check `page_id`
-   is still absent (see Lock ordering).
-3. If the victim is dirty, flush it — a shared content latch suffices, since `pin_count == 0`
-   already implies no active writer.
-4. Remove the old mapping, insert the new one (`page_id → frame_id`) *before* releasing any
-   shard lock, so a concurrent fetcher of this same new page finds it and waits on `loading`
-   instead of racing to fetch it independently.
-5. Stamp frame metadata (`page_id`, `pin_count = 1`, `loading = true`, `is_dirty = false`).
-   Release shard lock(s).
-6. Perform `DiskManager::ReadPage` outside any lock. `loading = true` is what makes concurrent
-   hit-path lookups wait instead of proceeding on stale content.
-7. On completion: metadata mutex, `loading = false`, notify all waiters, release.
+1. `free_list_.TryPop()`, else reclaim inline. `BufferPoolFull` propagates from there.
+2. Re-acquire the shard lock and **look up again**. If present: release, push our frame back to the
+   free list, restart from the hit path.
+3. Still under the shard lock: insert the mapping, and under the metadata mutex stamp `page_id`,
+   `Loading`, `pin_count = 1`, epochs zeroed. Release both. The mapping goes in before the read so
+   a concurrent fetcher of the same page waits on `Loading` instead of racing.
+4. `DiskManager::ReadPage`, under no lock.
+5. Success: metadata mutex, `Resident`, notify all, release. Then `RecordAccess`, content latch,
+   return the guard.
+6. Failure: the failed-load path, then return the error.
+
+### Failed load
+
+The loader owns disposal.
+
+1. Loader takes the shard lock, erases the mapping, releases it.
+2. Metadata mutex: `state = Failed`, notify all.
+3. Each waiter wakes, sees `Failed`, decrements its pin, notifies, returns the error. No disposal.
+4. Loader waits until `pin_count == 1` (its own), then resets to `Free`, drops its pin, and pushes
+   to the free list — not the replacer.
 
 ### NewPage / DeletePage / UnpinPage / FlushPage
 
-- **NewPage** — same frame-acquisition path as a miss, but calls `DiskManager::AllocatePage`
-  instead of reading; there's nothing on disk yet to read.
-- **DeletePage** — rejects if `pin_count != 0`. Otherwise: acquire the replacer lock and remove
-  the frame from the candidate set — it's in there, since `pin_count == 0` means the last
-  `UnpinPage` already made it evictable — re-verifying `pin_count == 0` under the frame's
-  metadata mutex while still holding the replacer lock, the same order eviction itself uses.
-  This closes a race where a concurrent `FetchPage` miss's `Evict()` could otherwise select this
-  exact frame as a victim at the same moment it's being deleted, handing two threads the same
-  `frame_id`. Only then: `DiskManager::DeallocatePage`, remove the page-table entry, reset frame
-  metadata, and return the frame to the **free list** (not back to the replacer — it holds no
-  content worth tracking as an eviction candidate anymore).
-- **UnpinPage** — decrement `pin_count` (guard against underflow); OR the caller's `is_dirty`
-  into the frame's flag rather than overwrite it, since two concurrent pinners — one clean, one
-  dirty — must leave the frame dirty. At `pin_count == 0`, mark the frame evictable (after
-  releasing the metadata mutex, per the ordering fix).
-- **FlushPage / FlushAllPages** — shared content latch (a flush is just another reader),
-  `DiskManager::WritePage`, clear the dirty flag under the metadata mutex. `FlushAllPages` is a
-  sequential loop over resident frames calling the same per-frame path — **best-effort, not
-  atomic across frames**. Nothing above the buffer pool needs cross-frame flush atomicity yet:
-  there's no WAL/checkpoint layer to coordinate with, and the crash-safety guarantee this
-  codebase targets (surviving `kill -9`, not power loss — see [DD-001](./DD-001-storage-file-layout.md))
-  doesn't demand it either. Revisit if/when a checkpoint protocol is designed.
+- **NewPage** — get a frame as in miss step 1, then `DiskManager::AllocatePage` outside every lock.
+  No `Loading` phase and no re-lookup race. Shard lock, insert mapping, stamp `Resident` and
+  `pin_count = 1`, release, zero the buffer under the content latch, return a `WritePageGuard`.
+- **DeletePage** — shard lock, then metadata mutex. Reject if `pin_count != 0`. Dirty contents are
+  discarded without a flush. Set `INVALID_PAGE`, `Free`, reset epochs, erase the mapping, release
+  both. Then `SetEvictable(false)`, `DiskManager::DeallocatePage`, push to the free list. Vacating
+  before deallocating satisfies `DeallocatePage`'s not-resident contract.
+- **UnpinPage** — private, guard-only. Decrement (guarding underflow); at zero mark evictable,
+  after releasing the metadata mutex.
+- **FlushPage / FlushAllPages** — pin first, run the flush sequence, unpin. `FlushAllPages` is a
+  sequential loop, **best-effort, not atomic across frames**.
 
-## Non-goals (this iteration)
+## Known behaviour
 
-- Lock-free (RCU/hazard-pointer) buffer pool — not justified for "comparable to commercial,"
-  which this design already achieves without it.
-- Async I/O (io_uring) replacing the loading-flag/condvar path.
-- NUMA-aware frame placement or partition affinity.
-- Sharding the free list or replacer themselves — both are single global structures behind one
-  lock each. Acceptable for now: those locks are only taken on the miss path and on pin-count
-  transitions, while the replacer's per-access traffic (`RecordAccess`) bypasses its lock
-  entirely via atomic counters (see Synchronization primitives, #6); revisit only if
-  measurement shows contention there.
+- `DeletePage` can spuriously fail while a reclaimer holds a transient pin across a dirty victim's
+  writeback. It rejects rather than waiting, so deleting a page you still hold a guard on is an
+  error rather than a deadlock.
+- A reclaimer can flush a victim and then lose it to a fetcher that pins during the writeback.
+  Wasted work, nothing corrupted.
+- A miss that picks a dirty victim pays the write inline.
+
+## Non-goals
+
+- A background cleaner thread (bgwriter / page cleaner). Add it when measurement shows misses
+  stalling on writeback.
+- Packing `state` and `pin_count` into one CAS'd atomic word (LeanStore/Umbra style).
+- Lock-free/RCU buffer pool; async I/O (io_uring); NUMA-aware placement.
+- Read→write latch upgrade, and the optimistic B+tree descent that would want it.
+- Sharding the free list or replacer; a per-shard clock hand.
+- A spin-then-block content latch replacing `std::shared_mutex`.

@@ -5,6 +5,7 @@
 #include <atomic>
 #include <cstddef>
 #include <optional>
+#include <random>
 #include <thread>
 #include <vector>
 
@@ -234,7 +235,48 @@ TEST(ReplacerTest, HammerConcurrentAccessAndEviction) {
 	//     check and tsan's race detector are the verdict.
 	// Keep iteration counts high enough to force interleavings but low
 	// enough that the tsan build finishes in seconds, not minutes.
-	ASSERT_TRUE(false);
+
+	constexpr std::size_t kFrames = 64;
+	Replacer replacer(kFrames);
+	std::vector<std::atomic<bool>> claimed(kFrames);
+
+	for (frame_id_t i = 0; i < static_cast<frame_id_t>(kFrames); ++i) {
+		replacer.SetEvictable(i, true);
+	}
+
+	for (int iter = 0; iter < 1000; ++iter) {
+		auto victim = replacer.Evict();
+		if (!victim) continue;
+		const auto v = static_cast<std::size_t>(*victim);
+		EXPECT_FALSE(claimed[v].exchange(true));
+		claimed[v].store(false);
+		replacer.SetEvictable(*victim, true);
+	}
+
+	auto evictor = [&]() {
+		for (int iter = 0; iter < 20000; ++iter) {
+			auto victim = replacer.Evict();
+			if (!victim) continue;
+			const auto v = static_cast<std::size_t>(*victim);
+			EXPECT_FALSE(claimed[v].exchange(true));
+			claimed[v].store(false);
+			replacer.SetEvictable(*victim, true);
+		}
+	};
+
+	auto accessor = [&](unsigned seed) {
+		std::mt19937 rng(seed);
+		std::uniform_int_distribution<frame_id_t> dist(0, static_cast<frame_id_t>(kFrames) - 1);
+		for (int iter = 0; iter < 20000; ++iter) {
+			replacer.RecordAccess(dist(rng));
+		}
+	};
+
+	std::vector<std::thread> threads;
+	threads.reserve(6);
+	for (int i = 0; i < 4; ++i) threads.emplace_back(accessor, static_cast<unsigned>(i + 1));
+	for (int i = 0; i < 2; ++i) threads.emplace_back(evictor);
+	for (auto& t : threads) t.join();
 }
 
 }  // namespace kernsql

@@ -1,22 +1,23 @@
 #pragma once
 
+#include <cstddef>
 #include <mutex>
 #include <optional>
-#include <stack>
 #include <vector>
 
 #include "common/types.hpp"
 
 namespace kernsql {
 
-// FreeList tracks frame_ids that have never held a page yet, or were just vacated by
-// DeletePage — distinct from the Replacer, which tracks frames currently holding a page
-// but unpinned (see DD-002, "Free list vs. replacer"). Popping is unconditionally O(1)
-// and touches nothing else, which is what lets BufferPoolManager avoid running the
-// clock sweep at all during warm-up, before every frame has held a page at least once.
+// FreeList tracks frame_ids in state FrameState::Free: never used yet, vacated by DeletePage,
+// or just turned Free by a reclaimer — distinct from the Replacer, which tracks frames that
+// hold a page but are unpinned (see DD-002, "Free list and replacer").
 //
-// Guarded by its own plain mutex (DD-002 mechanism #5) — short critical section
-// (push/pop one frame_id), touched only on the miss path.
+// It is a plain LIFO stack behind a plain mutex, and deliberately nothing more. An empty free
+// list is a normal outcome rather than something to block on: a miss that finds it empty
+// reclaims a frame inline through the Replacer instead. Nothing ever waits on this structure,
+// so it has no producer/consumer sides to coordinate — hence no condition variable, no
+// pool-exhausted signal, no watermarks and no shutdown handshake.
 class FreeList {
   public:
 	// Fully populates the list with every index 0..capacity-1 up front, so a freshly
@@ -36,17 +37,23 @@ class FreeList {
 		lifo_.push_back(frame_id);
 	}
 
-	// nullopt => list empty, caller falls through to the replacer.
-	[[nodiscard]] std::optional<frame_id_t> Pop() {
+	// nullopt => empty right now. Not an error: it is the miss path's cue to reclaim a frame
+	// itself, which is the only other source of free frames.
+	[[nodiscard]] std::optional<frame_id_t> TryPop() {
 		std::lock_guard<std::mutex> lock(mtx_);
 		if (lifo_.empty()) return std::nullopt;
-		frame_id_t elem = lifo_.back();
+		frame_id_t frame_id = lifo_.back();
 		lifo_.pop_back();
-		return elem;
+		return frame_id;
+	}
+
+	[[nodiscard]] std::size_t Size() const {
+		std::lock_guard<std::mutex> lock(mtx_);
+		return lifo_.size();
 	}
 
   private:
-	std::mutex mtx_;
+	mutable std::mutex mtx_;
 	std::vector<frame_id_t> lifo_;
 };
 

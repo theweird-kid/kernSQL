@@ -10,6 +10,19 @@
 #include "common/types.hpp"
 
 namespace kernsql {
+
+// Clock-sweep eviction-candidate set: frames that currently hold a page but are unpinned.
+//
+// Threading note (DD-002, "Reclaiming a frame"): every method here is called from any thread.
+// RecordAccess and SetEvictable fire on every access and every pin-count transition; Evict()
+// is called by whichever thread missed and found the FreeList empty, and reclaims a frame
+// inline. There is no background thread.
+//
+// Two concurrent Evict() callers are therefore expected, and are safe because Evict removes
+// its victim from the candidate set before returning — so they cannot be handed the same
+// frame. The caller then re-validates the victim under its page-table shard lock and metadata
+// mutex, and a caller that declines the frame it was given is a normal outcome, not an error:
+// the frame simply stays out of the candidate set until its next unpin re-adds it.
 class Replacer {
   public:
 	explicit Replacer(std::size_t capacity) : usage_count_(capacity), evictable_(capacity) {}

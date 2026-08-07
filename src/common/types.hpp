@@ -25,6 +25,27 @@ struct RID {
 	bool isValid() const { return page_id != INVALID_PAGE; }
 };
 
-enum class PageType : uint8_t { META, INDEX_INTERNAL, INDEX_LEAF, HEAP, ALLOCATED, FREE, CATALOG };
+// INVALID is pinned at 0 so that an all-zero page cannot pass for a real one. Zeros
+// are what the filesystem hands back for a sparse or truncate-extended file, so with
+// META at 0 an empty file's page 0 validated as a genuine meta page — and Open() then
+// read a freelist head of 0 out of the zeroed next_page_id, putting the reserved meta
+// page itself at the head of the freelist.
+//
+// This is a cheap mitigation, not a format check: a garbage file whose first byte
+// happens to equal a valid PageType still passes. A magic + version field in the meta
+// page is the actual answer and does not exist yet.
+//
+// These values are persisted in every page header, so renumbering them is an on-disk
+// format break. Append new types at the end; never reorder or reuse a value.
+enum class PageType : uint8_t {
+	INVALID = 0,
+	META,
+	INDEX_INTERNAL,
+	INDEX_LEAF,
+	HEAP,
+	ALLOCATED,
+	FREE,
+	CATALOG
+};
 
 }  // namespace kernsql

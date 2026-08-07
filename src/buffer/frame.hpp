@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -10,6 +11,27 @@
 #include "common/types.hpp"
 
 namespace kernsql {
+
+// A frame's lifecycle (DD-002, "Frame lifecycle"), guarded by Frame::mtx_. One enum rather
+// than a set of booleans, so the illegal combinations are unrepresentable rather than merely
+// unreachable, and every transition has exactly one owner.
+//
+// There is deliberately no Reclaiming state. Reclaim performs no I/O, so it completes inside a
+// single critical section under the victim's shard lock and metadata mutex — no other thread
+// can observe a frame mid-reclaim, so there is nothing to cancel.
+enum class FrameState : uint8_t {
+	// Holds no page: unmapped, unpinned, sitting on the free list.
+	Free,
+	// A disk read is in flight. Already mapped, so a concurrent fetcher of the same page finds
+	// it and waits on cv_ rather than racing to load it independently; data_ is meaningless
+	// until the loader publishes Resident.
+	Loading,
+	// Holds a valid page. In the Replacer's candidate set iff pin_count_ == 0.
+	Resident,
+	// The load errored. Already unmapped by the loader, which owns disposal — waiters observe
+	// this, drop their pins and return the error without cleaning up themselves.
+	Failed,
+};
 
 // Frame is the in-memory container for one cached page (see DD-002). It owns two
 // independent synchronization primitives, deliberately kept separate: `latch_` guards
@@ -27,13 +49,35 @@ struct Frame {
 	std::array<std::byte, PAGE_SIZE> data_;
 	std::shared_mutex latch_;
 
+	// --- Dirtiness: two monotonic counters, guarded by NEITHER lock (DD-002, "Dirtiness
+	// as an epoch pair"). The frame is dirty iff dirty_epoch_ > flushed_epoch_.
+	//
+	// This is deliberately not a `bool is_dirty_` under mtx_. A flusher must hold the
+	// shared content latch while it writes (or it captures a torn page), and if it then
+	// dropped the latch before clearing the bool, a writer could dirty the page in the gap
+	// and have its flag cleared a moment later — a lost update on disk. Keeping the bool
+	// correct therefore required holding latch_ and mtx_ simultaneously, in the *reverse*
+	// of this codebase's canonical lock order. With epochs there is nothing to clear, so
+	// the two locks are never held together at all.
+	//
+	// Unlike Replacer::usage_count_, these are NOT heuristic counters — a missed dirty bump
+	// loses data — so they use release/acquire rather than relaxed ordering. The cost is
+	// nil on x86 and it keeps the reasoning local instead of leaning on the fact that mtx_
+	// happens to order most of these accesses anyway.
+	std::atomic<uint64_t> dirty_epoch_{0};
+	std::atomic<uint64_t> flushed_epoch_{0};
+
 	// --- Everything below is guarded by mtx_ ---
 	std::mutex mtx_;
-	page_id_t page_id_{INVALID_PAGE};  // INVALID_PAGE => frame is unused / on the free list.
-	int32_t pin_count_{0};             // evictable only when this is 0.
-	bool is_dirty_{false};             // modified since the last flush to disk.
-	bool loading_{false};              // true while a disk read for this frame is in flight.
-	std::condition_variable cv_;       // paired with mtx_; fetchers block on this while loading_.
+	FrameState state_{FrameState::Free};
+	page_id_t page_id_{INVALID_PAGE};  // INVALID_PAGE iff state_ == Free.
+	int32_t pin_count_{0};             // a claim on this frame's identity — DD-002, "The pin
+	                                   // invariant". Evictable only at 0.
+
+	// Paired with mtx_. Two waits use it, and both hold a pin while they sleep: a miss waiter
+	// blocks here while state_ == Loading, and on the failed-load path the loader blocks here
+	// until pin_count_ falls to 1 (its own) so it can dispose of the frame itself.
+	std::condition_variable cv_;
 
 	Frame() = default;
 
@@ -45,15 +89,55 @@ struct Frame {
 	Frame(Frame&&) = delete;
 	Frame& operator=(Frame&&) = delete;
 
-	// Acquire the content latch. Always bind the result with `auto` — the concrete lock
-	// type is an implementation detail that will change once `latch_` is replaced by a
-	// hybrid spin-then-block latch (see DD-002); callers that never name the type stay
-	// unaffected by that swap.
-	[[nodiscard]] std::shared_lock<std::shared_mutex> AcquireRead() {
-		return std::shared_lock(latch_);
+	// The concrete lock types are an implementation detail that will change once `latch_` is
+	// replaced by a hybrid spin-then-block latch (see DD-002). Bind with `auto` where you can;
+	// where you cannot — a page guard has to name the type to store one as a member — spell it
+	// as Frame::ReadLatch / Frame::WriteLatch so the swap stays a one-line change here.
+	//
+	// Whatever replaces them must keep the same three operations the guards rely on: move
+	// construction, `unlock()`, and a destructor that releases only if still held.
+	using ReadLatch = std::shared_lock<std::shared_mutex>;
+	using WriteLatch = std::unique_lock<std::shared_mutex>;
+
+	[[nodiscard]] ReadLatch AcquireRead() { return ReadLatch(latch_); }
+	[[nodiscard]] WriteLatch AcquireWrite() { return WriteLatch(latch_); }
+
+	// --- Dirty-epoch protocol (DD-002). None of these take a lock. ---
+
+	// Called by WritePageGuard's release, BEFORE it drops the content latch, so a flusher
+	// holding the shared latch always observes an epoch that already accounts for every
+	// write it is about to capture.
+	void MarkDirty() { dirty_epoch_.fetch_add(1, std::memory_order_release); }
+
+	[[nodiscard]] bool IsDirty() const {
+		return dirty_epoch_.load(std::memory_order_acquire) >
+		       flushed_epoch_.load(std::memory_order_acquire);
 	}
-	[[nodiscard]] std::unique_lock<std::shared_mutex> AcquireWrite() {
-		return std::unique_lock(latch_);
+
+	// Step 2 of the flush sequence: sample the epoch while holding the shared content latch,
+	// hand the result to MarkFlushed() once the write completes.
+	[[nodiscard]] uint64_t SampleDirtyEpoch() const {
+		return dirty_epoch_.load(std::memory_order_acquire);
+	}
+
+	// Step 5: raise flushed_epoch_ to `observed`. Only ever moves upward, so concurrent
+	// flushers cannot walk it backwards. A writer that dirtied the page after the latch was
+	// released has already bumped dirty_epoch_ past `observed`, leaving the frame dirty —
+	// which is the only direction that is safe to be wrong in.
+	void MarkFlushed(uint64_t observed) {
+		uint64_t current = flushed_epoch_.load(std::memory_order_relaxed);
+		while (current < observed && !flushed_epoch_.compare_exchange_weak(
+		                                 current, observed, std::memory_order_release,
+		                                 std::memory_order_relaxed)) {
+		}
+	}
+
+	// Called when a frame is repurposed (miss path stamping it, a reclaimer turning it Free,
+	// DeletePage vacating it) — always with mtx_ held and no other thread holding a pin, so a
+	// plain store is enough.
+	void ResetEpochs() {
+		dirty_epoch_.store(0, std::memory_order_relaxed);
+		flushed_epoch_.store(0, std::memory_order_relaxed);
 	}
 };
 

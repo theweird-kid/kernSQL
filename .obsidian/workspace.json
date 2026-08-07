@@ -41,7 +41,9 @@
               "type": "file-explorer",
               "state": {
                 "sortOrder": "alphabetical",
-                "autoReveal": false
+                "autoReveal": false,
+                "showSearch": false,
+                "searchQuery": ""
               },
               "icon": "lucide-folder-closed",
               "title": "Files"
@@ -188,15 +190,15 @@
   "lastOpenFiles": [
     "build/debug/Testing/Temporary/CTestCheckpoint.txt",
     "build/debug/Testing/Temporary/LastTest.log.tmp",
-    "build/debug/CMakeFiles/disk_manager_test.dir/link.d",
-    "build/debug/CMakeFiles/disk_manager_test.dir/test/storage/disk_manager_test.cpp.o.d",
-    "build/debug/replacer_test[1]_tests.cmake",
-    "build/debug/replacer_test",
-    "build/debug/stvyZyHK",
-    "build/debug/st8Trria",
-    "build/debug/CMakeFiles/replacer_test.dir/test/buffer/replacer_test.cpp.o",
+    "build/debug/CMakeFiles/replacer_test.dir/link.d",
     "build/debug/CMakeFiles/replacer_test.dir/test/buffer/replacer_test.cpp.o.d",
-    "build/debug/CMakeFiles/kernsql_lib.dir/src/storage/disk_manager.cpp.o.d",
+    "src/buffer/buffer_pool_manager.hpp.tmp.13732.e78d505c6bff",
+    "src/buffer/page_guard.hpp",
+    "src/buffer/page_guard.hpp.tmp.13732.5d46a16cad08",
+    "src/buffer/frame.hpp.tmp.13732.6858e4c83813",
+    "build/tsan/CMakeFiles/replacer_test.dir/test/buffer/replacer_test.cpp.o.d",
+    "build/tsan/CMakeFiles/replacer_test.dir/test/buffer/replacer_test.cpp-172b62e0.o.tmp",
+    "build/tsan/Testing/Temporary/CTestCheckpoint.txt",
     "design-docs/DD-002-buffer-manager.md",
     "design-docs/notes/Buffer-Pool-Manager.md",
     "design-docs.md",
