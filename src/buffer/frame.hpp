@@ -5,6 +5,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <format>
 #include <mutex>
 #include <shared_mutex>
 
@@ -32,6 +33,25 @@ enum class FrameState : uint8_t {
 	// this, drop their pins and return the error without cleaning up themselves.
 	Failed,
 };
+
+// The one place the state names live. std::formatter below delegates here rather than carrying
+// its own switch, and the printf-style LOG_* macros need it because they cannot see a
+// std::formatter at all — passing a FrameState for %s makes vsnprintf dereference the enum's
+// value as a pointer. Returns a string literal, so it allocates nothing and is safe on an
+// error path.
+[[nodiscard]] constexpr const char* FrameStateName(FrameState state) {
+	switch (state) {
+		case FrameState::Free:
+			return "Free";
+		case FrameState::Loading:
+			return "Loading";
+		case FrameState::Resident:
+			return "Resident";
+		case FrameState::Failed:
+			return "Failed";
+	}
+	return "Unknown";
+}
 
 // Frame is the in-memory container for one cached page (see DD-002). It owns two
 // independent synchronization primitives, deliberately kept separate: `latch_` guards
@@ -143,9 +163,9 @@ struct alignas(64) Frame {
 	// which is the only direction that is safe to be wrong in.
 	void MarkFlushed(uint64_t observed) {
 		uint64_t current = flushed_epoch_.load(std::memory_order_relaxed);
-		while (current < observed && !flushed_epoch_.compare_exchange_weak(
-		                                 current, observed, std::memory_order_release,
-		                                 std::memory_order_relaxed)) {
+		while (current < observed &&
+		       !flushed_epoch_.compare_exchange_weak(current, observed, std::memory_order_release,
+		                                             std::memory_order_relaxed)) {
 		}
 	}
 
@@ -159,3 +179,17 @@ struct alignas(64) Frame {
 };
 
 }  // namespace kernsql
+
+// Specialize std::formatter for FrameState
+template <>
+struct std::formatter<kernsql::FrameState> {
+	// Parses format specifiers (e.g., {:x}). We just accept standard empty {} bounds.
+	constexpr auto parse(format_parse_context& ctx) { return ctx.begin(); }
+
+	// Formats the FrameState enum value into the output context. Delegates to FrameStateName so
+	// the names exist in exactly one place — the LOG_* macros need the same mapping and cannot
+	// reach a std::formatter.
+	auto format(const kernsql::FrameState& state, format_context& ctx) const {
+		return std::format_to(ctx.out(), "{}", kernsql::FrameStateName(state));
+	}
+};

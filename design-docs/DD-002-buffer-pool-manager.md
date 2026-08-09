@@ -51,7 +51,9 @@ replacer's).
 
 1. **Content latch** (per frame, reader/writer) — the page bytes. Held as long as a caller's access
    needs. `std::shared_mutex` behind `Frame::AcquireRead`/`AcquireWrite`, which return `auto`-bound
-   locks so the type stays swappable.
+   locks so the type stays swappable. A replacement lock type must provide **move construction,
+   move assignment, `unlock()`, and a destructor that releases only if still held** — move
+   assignment is required by the guards' own move-assignment operator, not just by the fetch paths.
 2. **Metadata mutex** (per frame) — `state`, `pin_count`, `page_id`. Must be a real mutex, not an
    atomic word: `Loading` needs a condition variable to wait on.
 3. **Page-table shard locks** — the `page_id → frame_id` map split into 16 shards, keyed
@@ -186,9 +188,15 @@ Step 1 precedes 2 so a flusher sees an epoch covering every write it is about to
 precedes 3 so a reclaimer's clean-check is exact. The frame cannot be reclaimed between 2 and 3 —
 the pin, not the latch, protects identity. `WritePageGuard` bumps the epoch **unconditionally**.
 
-**Value semantics:** non-copyable; movable, with the moved-from guard's manager pointer nulled and
-move-assignment releasing before taking over. `Drop()` is explicit and idempotent; the destructor
-calls it.
+**Value semantics:** non-copyable; movable, with the moved-from guard's manager pointer nulled.
+`Drop()` is explicit and idempotent; the destructor calls it.
+
+Move-assignment **releases before taking over**, and checks self-assignment **by address**
+(`this == &other`) — guards have no `operator==`, and the question is identity, not equality.
+Without that check, `g = std::move(g)` drops the pin and then assigns the nulled members to
+themselves, silently leaving a live-looking guard that holds nothing. Transfer is an explicit
+`Drop()`-then-steal, **not** a swap: swapping hands the old pin to the moved-from object, deferring
+its release to that object's lifetime instead of now.
 
 `UnpinPage` is **private**; the guards are friends. Guards live in `page_guard.{hpp,cpp}` with
 `BufferPoolManager` forward-declared.
@@ -226,9 +234,14 @@ The loader owns disposal.
 
 1. Loader takes the shard lock, erases the mapping, releases it.
 2. Metadata mutex: `state = Failed`, notify all.
-3. Each waiter wakes, sees `Failed`, decrements its pin, notifies, returns the error. No disposal.
+3. Each waiter wakes, sees `Failed`, and drops its pin **through `UnpinPage`** — which notifies on
+   `Failed` precisely so this path has no second decrement site. No disposal.
 4. Loader waits until `pin_count == 1` (its own), then resets to `Free`, drops its pin, and pushes
    to the free list — not the replacer.
+
+`UnpinPage` is the single place a pin is ever decremented. Any other decrement is a bug: it would
+be a second site that has to remember the `Failed` notify, and forgetting it parks the loader on
+the condvar forever.
 
 ### NewPage / DeletePage / UnpinPage / FlushPage
 
@@ -239,10 +252,56 @@ The loader owns disposal.
   discarded without a flush. Set `INVALID_PAGE`, `Free`, reset epochs, erase the mapping, release
   both. Then `SetEvictable(false)`, `DiskManager::DeallocatePage`, push to the free list. Vacating
   before deallocating satisfies `DeallocatePage`'s not-resident contract.
-- **UnpinPage** — private, guard-only. Decrement (guarding underflow); at zero mark evictable,
-  after releasing the metadata mutex.
+- **UnpinPage** — private, guard-only. Under the metadata mutex: notify all if `Failed`, then note
+  whether this is a **1→0 transition on a `Resident` frame**, then decrement. Release the mutex,
+  and only then `SetEvictable(true)` if it transitioned.
+
+  Both halves of that condition are load-bearing. Testing the post-decrement value instead of the
+  transition would mark a frame evictable on a spurious unpin at `pin_count == 0`; testing the pin
+  without the state would admit a `Free` frame — one already on the free list — into the candidate
+  set, so `TryPop` and `Evict` could hand the same frame to two threads.
+
+  **Underflow is a caller bug, not a condition to absorb.** Assert in debug; in release the count
+  goes negative and the frame is permanently stuck (never 1→0 again, so never re-evictable, and
+  `DeletePage` rejects it forever), which is a capacity leak rather than corruption. Log it at a
+  level that survives `NDEBUG`.
 - **FlushPage / FlushAllPages** — pin first, run the flush sequence, unpin. `FlushAllPages` is a
   sequential loop, **best-effort, not atomic across frames**.
+
+### Shutdown and destruction
+
+Flushing is **not** the destructor's job. `Status Shutdown()` is the durable operation; the
+destructor is a backstop that reports the caller's mistake.
+
+**`Shutdown()`** — idempotent. Verify quiescence (every frame `pin_count == 0` and not `Loading`),
+then `FlushAllPages()`, then **`DiskManager::Sync()`**. Both steps: `FlushAllPages` moves page bytes
+into the OS page cache via `pwrite`, which is not durability. Returns `Status`, so the caller can
+decide what a failure means — exit non-zero, refuse to mark the database cleanly closed.
+
+**Quiescence is a precondition, not something the pool arranges.** Destroying an object while
+another thread uses it is undefined regardless of what the destructor does: a live `WritePageGuard`
+holds a `BufferPoolManager*` that dangles the instant `~BufferPoolManager` returns, and its later
+`Drop()` calls `UnpinPage` on freed memory. No locking inside the destructor can prevent that. The
+owner establishes quiescence by **joining every worker thread** — guards are stack-scoped, so an
+unwound stack has released every pin, and `join()` supplies the synchronizes-with edge. See
+[DD-003](./DD-003-threading-model.md).
+
+**A non-zero pin at destruction is therefore proof that a guard outlived the pool.** Assert on it
+rather than working around it — this is a use-after-free you want to fail loudly in the test suite.
+
+**`~BufferPoolManager`** — if `Shutdown()` already ran, nothing to do. If it did not, that is a
+caller bug: log it, best-effort flush, and abort rather than silently discarding dirty pages. A
+destructor cannot return a `Status` or throw, so it is structurally the wrong place to be deciding
+what a failed flush means.
+
+This mirrors `DiskManager`, which does not `fsync` in `~DiskManager` and lists implicit durability
+as an explicit non-goal ([DD-001](./DD-001-storage-file-layout.md)). It also removes a destruction-
+order hazard: the pool holds `DiskManager&`, so a destructor-driven flush is only correct while
+that reference outlives the pool — an ordering constraint that disappears entirely once the flush
+happens before either destructor runs.
+
+Once a WAL exists, the shutdown flush becomes a restart-time optimization rather than the
+durability mechanism. It is load-bearing today only because there is no log yet.
 
 ## Known behaviour
 
@@ -255,6 +314,7 @@ The loader owns disposal.
 
 ## Non-goals
 
+- **Durability without an explicit `Shutdown()`**, mirroring `DiskManager`'s stance on `Sync()`.
 - A background cleaner thread (bgwriter / page cleaner). Add it when measurement shows misses
   stalling on writeback.
 - Packing `state` and `pin_count` into one CAS'd atomic word (LeanStore/Umbra style).

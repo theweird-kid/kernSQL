@@ -1,5 +1,7 @@
 #include "logger.hpp"
 
+#include <unistd.h>
+
 #include <chrono>
 #include <cstdarg>
 #include <cstdio>
@@ -9,6 +11,18 @@
 namespace {
 
 std::mutex g_log_mutex;
+
+// The kernel TID, not std::thread::id: this is the number gdb reports as LWP, that `perf` and
+// `top -H` show, and that names the directory under /proc/<pid>/task — so a log line can be
+// matched against a debugger session. std::thread::id has no printf conversion and hashes to
+// something that matches nothing outside this process.
+//
+// Cached per thread: gettid() is a real syscall, and a thread's id never changes, so this costs
+// one syscall per thread for the life of the process rather than one per log line.
+int cached_tid() {
+	static thread_local const int tid = static_cast<int>(gettid());
+	return tid;
+}
 
 const char* level_tag(LogLevel level) {
 	switch (level) {
@@ -44,8 +58,8 @@ void log_impl(LogLevel level, const char* file, int line, const char* fmt, ...) 
 
 	// 3. Assemble the full line, then do one write under the mutex.
 	char linebuf[1280];
-	std::snprintf(linebuf, sizeof(linebuf), "%s.%03d [%-5s] %s:%d  %s\n", ts,
-	              static_cast<int>(ms.count()), level_tag(level), file, line, msg);
+	std::snprintf(linebuf, sizeof(linebuf), "%s.%03d [%-5s] [tid %d] %s:%d  %s\n", ts,
+	              static_cast<int>(ms.count()), level_tag(level), cached_tid(), file, line, msg);
 
 	std::lock_guard<std::mutex> guard(g_log_mutex);
 	std::fputs(linebuf, stdout);
