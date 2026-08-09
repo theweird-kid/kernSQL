@@ -4,3 +4,4 @@ compile_commands.json
 *.db
 *.wal
 .claude
+next_steps.txt

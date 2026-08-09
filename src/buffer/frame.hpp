@@ -44,10 +44,27 @@ enum class FrameState : uint8_t {
 // in the pool array), `page_lsn` (already part of `data_`'s on-disk page header; a WAL
 // concern, not a buffer-pool one), and `usage_count` (belongs to the Replacer's
 // bookkeeping, not the frame's identity).
-struct Frame {
+//
+// Cache-line aligned. `data_` sits at offset 0 and is exactly PAGE_SIZE — a whole number of
+// 64-byte lines — so this one annotation buys both separations that matter: the metadata below
+// starts on a line of its own instead of sharing one with the tail of the page bytes, and
+// `sizeof(Frame)` rounds up to a multiple of 64, so frame N's metadata cannot share a line with
+// frame N+1's page bytes either. Without it a thread writing page bytes and a thread probing an
+// unrelated frame's pin count bounce the same line between cores for no reason. Postgres gets
+// this separation structurally by keeping BufferDescriptors and BufferBlocks in two arrays; this
+// is the cheap version of the same idea, costing 16 bytes of tail padding per frame
+// (sizeof goes 4272 -> 4288, or 0.4%).
+//
+// The pool's `new Frame[n]` honours it because C++17 routes over-aligned types through
+// operator new[](size_t, align_val_t) — this silently did nothing before C++17.
+struct alignas(64) Frame {
 	// The PAGE_SIZE bytes currently resident in this frame. Guarded by `latch_`.
 	std::array<std::byte, PAGE_SIZE> data_;
-	std::shared_mutex latch_;
+
+	// The alignas is redundant today — `data_` alone already lands this at a 64-byte offset —
+	// but it is what actually pins the page-bytes/metadata split, so it is stated rather than
+	// left as a consequence of the member order above.
+	alignas(64) std::shared_mutex latch_;
 
 	// --- Dirtiness: two monotonic counters, guarded by NEITHER lock (DD-002, "Dirtiness
 	// as an epoch pair"). The frame is dirty iff dirty_epoch_ > flushed_epoch_.

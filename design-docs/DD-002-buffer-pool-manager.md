@@ -24,14 +24,14 @@ One `enum class FrameState` per frame, under the frame's metadata mutex.
 | `Resident` | yes    | valid       | ≥ 0       | iff `pin_count == 0` |
 | `Failed`   | no     | meaningless | ≥ 1       | no                   |
 
-| Transition          | Owner                                                          |
-|---------------------|----------------------------------------------------------------|
-| `Free → Loading`    | a fetch miss, under the new page's shard lock                   |
-| `Loading → Resident`| the loader, on a successful read; notifies waiters              |
-| `Loading → Failed`  | the loader, on a read error; erases the mapping first           |
-| `Failed → Free`     | the loader only, once waiters have dropped their pins           |
-| `Free → Resident`   | `NewPage` — nothing on disk to read, so no `Loading` phase      |
-| `Resident → Free`   | reclaim or `DeletePage`; requires unpinned and clean            |
+| Transition           | Owner                                                      |
+|----------------------|------------------------------------------------------------|
+| `Free → Loading`     | a fetch miss, under the new page's shard lock              |
+| `Loading → Resident` | the loader, on a successful read; notifies waiters         |
+| `Loading → Failed`   | the loader, on a read error; erases the mapping first      |
+| `Failed → Free`      | the loader only, once waiters have dropped their pins      |
+| `Free → Resident`    | `NewPage` — nothing on disk to read, so no `Loading` phase |
+| `Resident → Free`    | reclaim or `DeletePage`; requires unpinned and clean       |
 
 There is no `Reclaiming` state: reclaim performs no I/O, so it is one critical section and nothing
 can need to cancel it.
