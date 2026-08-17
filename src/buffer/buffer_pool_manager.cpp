@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <expected>
 #include <format>
 #include <mutex>
 
@@ -288,5 +289,122 @@ Result<frame_id_t> BufferPoolManager::FetchFrame(page_id_t page_id) {
 		// it was never in the candidate set to begin with.
 		replacer_.RecordAccess(frame_id);
 		return frame_id;  // pin_count == 1, and it is the caller's
+	}
+}
+
+Result<frame_id_t> BufferPoolManager::AcquireFrame() {
+	auto frame_id = free_list_.TryPop();
+	if (frame_id.has_value()) return frame_id.value();
+	return ReclaimFrame();
+}
+
+Result<frame_id_t> BufferPoolManager::ReclaimFrame() {
+	for (;;) {
+		auto victim = replacer_.Evict();
+		if (!victim.has_value()) {
+			return std::unexpected(Status::BufferPoolFull("buffer full"));
+		}
+
+		auto& frame = FrameAt(victim.value());
+
+		// Peek the victim's identity. A shard is keyed by page_id, which lives under the
+		// metadata mutex — and the canonical order forbids taking a shard lock while holding
+		// one. So read it here, release, and lock in order below. This value is nothing but a
+		// hint about WHICH shard to take; every predicate tested here is tested again under
+		// both locks, page_id_ included.
+		page_id_t peeked{INVALID_PAGE};
+		{
+			std::lock_guard lock(frame.mtx_);
+			if (frame.state_ != FrameState::Resident || frame.pin_count_ != 0)
+				continue;  // Delete page raced this thread
+			peeked = frame.page_id_;
+		}
+
+		// Scoped, because ShardGuard has no early unlock: the dirty path below must reach its
+		// flush with the shard lock already gone, and the end of this block is the only thing
+		// that releases it. Falling out of the block therefore means exactly one thing — the
+		// victim was dirty and we pinned it. Every other outcome returns or continues from
+		// inside.
+		{
+			auto shard = page_table_.AcquireShard(peeked);
+			std::lock_guard lock(frame.mtx_);
+
+			// Re-validate: the metadata mutex was released across the peek, so the frame may
+			// have been re-pinned, deleted, or repurposed into a different page since. A
+			// declined victim is a normal outcome, not an error — it stays out of the
+			// candidate set until its next unpin re-adds it.
+			if (frame.state_ != FrameState::Resident || frame.pin_count_ != 0 ||
+			    frame.page_id_ != peeked)
+				continue;
+
+			// Implied rather than checked: mappings change only under the shard lock we now
+			// hold, and every path that erases peeked's mapping leaves Resident in that same
+			// critical section. A mismatch means an invariant broke elsewhere.
+			assert(shard.Find(peeked) == victim);
+
+			// The clean-check is exact, not conservative. Nothing can newly dirty the frame —
+			// that needs a guard, which needs the mapping we hold the shard lock for — and
+			// nothing already dirtied is missed, since a guard's release bumps dirty_epoch_
+			// strictly before it decrements pin_count_.
+			if (!frame.IsDirty()) {
+				// The entire reclaim, with no I/O in it: one critical section, so no other
+				// thread can observe a frame mid-reclaim and there is nothing to cancel.
+				shard.Erase(peeked);
+				frame.page_id_ = INVALID_PAGE;
+				frame.state_ = FrameState::Free;
+				frame.ResetEpochs();  // stale epochs would read as dirty for the next occupant
+				return victim.value();
+			}
+
+			// Dirty. Pin across the writeback: the pin, not any lock, is what fixes the
+			// frame's identity while we hold no lock at all. The mapping stays live, so a
+			// concurrent fetcher of this page takes the hit path and pins — and we see
+			// pin_count_ > 1 at re-validation below and decline.
+			frame.pin_count_ += 1;
+		}  // both released
+
+		Status st = FlushFrame(victim.value(), peeked);
+		if (!st.ok()) {
+			// Deliberately NOT another trip round the loop. UnpinPage hands this frame back to
+			// the candidate set on its 1->0 transition, so the next Evict() can return it
+			// straight back to us — flush, fail, repeat. A persistently unwritable page would
+			// turn reclaim into a livelock rather than an error, so drop the pin and let the
+			// caller's fetch fail with the I/O error it actually hit.
+			UnpinPage(victim.value());
+			return std::unexpected(st);
+		}
+
+		{
+			auto shard = page_table_.AcquireShard(peeked);
+			std::lock_guard lock(frame.mtx_);
+
+			// Same checks, with two changes: pin_count_ == 1 is now the condition, that one
+			// being ours, and IsDirty() is asked again because a writer can have dirtied the
+			// page while the write was in flight.
+			if (frame.state_ == FrameState::Resident && frame.page_id_ == peeked &&
+			    frame.pin_count_ == 1 && !frame.IsDirty()) {
+				assert(shard.Find(peeked) == victim);
+				shard.Erase(peeked);
+				frame.page_id_ = INVALID_PAGE;
+				frame.state_ = FrameState::Free;
+				frame.ResetEpochs();
+
+				// Our own pin dies as part of the same stamp that unmaps the frame, NOT
+				// through UnpinPage. This is the narrow exception to "UnpinPage is the only
+				// place a pin is decremented" — that rule is about releasing a pin while the
+				// frame keeps its identity. Here the frame is becoming free-list stock, and
+				// UnpinPage would publish it to the replacer as an eviction candidate on the
+				// 1->0 transition, so TryPop and Evict could hand the same frame to two
+				// threads. AbandonLoad drops its pin the same way and for the same reason.
+				frame.pin_count_ = 0;
+				return victim.value();
+			}
+		}  // both released
+
+		// Lost it during the writeback — someone pinned it, or dirtied it again. Wasted work,
+		// nothing corrupted (DD-002, "Known behaviour"). UnpinPage only after both locks are
+		// gone: it may call into the replacer, and DD-002 keeps the replacer lock off any path
+		// that already holds a shard lock or a metadata mutex.
+		UnpinPage(victim.value());
 	}
 }
