@@ -7,6 +7,7 @@
 #include <expected>
 #include <format>
 #include <mutex>
+#include <span>
 
 #include "buffer/frame.hpp"
 #include "buffer/freelist.hpp"
@@ -276,6 +277,37 @@ Result<frame_id_t> BufferPoolManager::FetchFrame(page_id_t page_id) {
 			// or push here as well — that would be a double release.
 			AbandonLoad(frame_id, page_id);
 			return std::unexpected(st);
+		}
+
+		// Validate what came back BEFORE publishing it. Effectively free: the 4 KB read already
+		// happened, so this is two comparisons against bytes already in cache. Deliberately not
+		// done on the hit path — a resident page was validated when it missed.
+		//
+		// FREE catches a fetch of a deallocated page. That is a caller bug (nothing should hold
+		// a page id after deleting it), but without the check the page is silently re-cached,
+		// and the next AllocatePage to recycle that id finds a stale mapping — two frames
+		// claiming one page. It narrows rather than closes the window: a fetch that lands
+		// between DeletePage's mapping erase and its DeallocatePage still reads the old header
+		// and passes. The full guarantee has to come from the layer above never asking for a
+		// page it deleted.
+		//
+		// A page_id mismatch catches a different class: a misdirected write, an off-by-one in
+		// page arithmetic, a torn extend, a file copied at the wrong offset. The offset says
+		// which page we asked for and the header says which page the bytes think they are —
+		// only two independently derived answers can disagree, which is the whole reason the
+		// id is stored despite being implied by the offset.
+		const auto header = PageHeader::ReadFrom(std::span(frame.data_).first<PAGE_HEADER_SIZE>());
+		if (header.page_type == PageType::FREE || header.page_id != page_id) {
+			Status bad =
+			    (header.page_type == PageType::FREE)
+			        ? Status::InvalidArgument(std::format("page {} is not allocated", page_id))
+			        : Status::Corruption(std::format("page {} header claims to be page {}",
+			                                         page_id, header.page_id));
+			// Same disposal path as a read error: the frame is Loading, mapped and pinned, and
+			// may have waiters asleep on it. Waiters get the generic Failed-path error rather
+			// than this one — a pre-existing property of that path, not new here.
+			AbandonLoad(frame_id, page_id);
+			return std::unexpected(bad);
 		}
 
 		{

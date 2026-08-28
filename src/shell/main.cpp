@@ -32,11 +32,10 @@ namespace {
 
 constexpr std::size_t kPoolFrames = 16;
 
-// Commands write into the page body, leaving the 24-byte header alone. The buffer pool has no
-// opinion about page contents (DD-003) — laying out a real page is the heap layer's job — so
-// this shell just treats the body as a NUL-terminated blob.
-constexpr std::size_t kBodyOffset = PAGE_HEADER_SIZE;
-constexpr std::size_t kBodySize = PAGE_SIZE - PAGE_HEADER_SIZE;
+// The guard hands out the body only — the header is not reachable as raw bytes, so there is
+// no offset arithmetic to get wrong here. The buffer pool has no opinion about page contents
+// (DD-003), so this shell just treats the body as a NUL-terminated blob.
+constexpr std::size_t kBodySize = PAGE_BODY_SIZE;
 
 std::string_view Trim(std::string_view s) {
 	while (!s.empty() && (s.front() == ' ' || s.front() == '\t')) s.remove_prefix(1);
@@ -91,7 +90,7 @@ void CmdWrite(BufferPoolManager& bpm, page_id_t page_id, std::string_view text) 
 		return;
 	}
 
-	auto body = guard->MutableData().subspan(kBodyOffset);
+	auto body = guard->MutableBody();
 	std::fill(body.begin(), body.end(), std::byte{0});  // no tail of a previous, longer write
 	std::memcpy(body.data(), text.data(), text.size());
 
@@ -107,7 +106,7 @@ void CmdRead(BufferPoolManager& bpm, page_id_t page_id) {
 		return;
 	}
 
-	auto body = guard->Data().subspan(kBodyOffset);
+	auto body = guard->Body();
 	std::size_t len = 0;
 	while (len < body.size() && body[len] != std::byte{0}) ++len;
 

@@ -3,10 +3,12 @@
 #include <array>
 #include <cassert>
 #include <cstddef>
+#include <cstdlib>
 #include <mutex>
 #include <optional>
 #include <unordered_map>
 
+#include "common/logger.hpp"
 #include "common/types.hpp"
 
 namespace kernsql {
@@ -25,10 +27,21 @@ class PageTable {
 			return std::nullopt;
 		}
 
+		// A duplicate key means two frames believe they hold the same page: writes land in
+		// one, reads come from the other, and whichever flushes last wins. That is silent
+		// data corruption, not a recoverable condition — so this survives NDEBUG rather than
+		// compiling out into an emplace that quietly does nothing and leaves the stale
+		// mapping in place. Same reasoning as ~BufferPoolManager aborting rather than
+		// discarding dirty pages: a destructor, and this, are both the wrong place to decide
+		// that corruption is survivable.
 		void Insert(page_id_t page_id, frame_id_t frame_id) {
 			assert(ShardIndex(page_id) == shard_index_);
 			auto [it, inserted] = map_.emplace(page_id, frame_id);
-			assert(inserted);
+			if (!inserted) {
+				LOG_INFO("page %d is already mapped to frame %d; refusing to remap it to %d",
+				         page_id, it->second, frame_id);
+				std::abort();
+			}
 		}
 		void Erase(page_id_t page_id) {
 			assert(ShardIndex(page_id) == shard_index_);

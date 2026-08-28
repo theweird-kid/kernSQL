@@ -17,6 +17,10 @@ inline constexpr page_id_t CATALOG_ROOT_PAGE_ID = 1;  // reserved page for catal
 inline constexpr std::size_t PAGE_SIZE = 4096;
 inline constexpr std::size_t PAGE_HEADER_SIZE = 32;
 
+// Everything after the header. This — not PAGE_SIZE — is what a page guard hands out, so a
+// caller cannot name the header bytes as raw memory and cannot clobber them.
+inline constexpr std::size_t PAGE_BODY_SIZE = PAGE_SIZE - PAGE_HEADER_SIZE;
+
 // Bumped whenever the on-disk layout of PageHeader changes in a way an older build would
 // misread. Stamped into every header DiskManager writes; nothing reads it back yet, which is
 // the point — it exists so that a future format change has a discriminator to branch on

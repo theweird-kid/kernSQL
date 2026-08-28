@@ -5,6 +5,7 @@
 #include <utility>
 
 #include "buffer/frame.hpp"
+#include "common/page_header.hpp"
 #include "common/types.hpp"
 
 namespace kernsql {
@@ -77,9 +78,24 @@ class ReadPageGuard {
 	// change while the guard lives anyway — a pinned frame is never repurposed.
 	[[nodiscard]] page_id_t PageId() const { return page_id_; }
 
-	// Valid for the guard's lifetime. Const-only: it is the type system, not a runtime mode
-	// check, that stops a reader writing.
-	[[nodiscard]] std::span<const std::byte, PAGE_SIZE> Data() const { return frame_->data_; }
+	// The page BODY — everything after the 32-byte header. Deliberately not the whole page:
+	// see WritePageGuard::MutableBody for why the header is unreachable as raw bytes.
+	// Const-only here; it is the type system, not a runtime mode check, that stops a reader
+	// writing.
+	[[nodiscard]] std::span<const std::byte, PAGE_BODY_SIZE> Body() const {
+		return std::span<const std::byte, PAGE_SIZE>(frame_->data_)
+		    .subspan<PAGE_HEADER_SIZE, PAGE_BODY_SIZE>();
+	}
+
+	// The header, BY VALUE. A copy, so there is no reference to write through.
+	//
+	// Header().page_id and PageId() answer different questions and should always agree:
+	// PageId() is what the buffer pool believes this frame holds, Header().page_id is what
+	// the bytes claim. Disagreement means the page was clobbered after it was validated.
+	[[nodiscard]] PageHeader Header() const {
+		return PageHeader::ReadFrom(
+		    std::span<const std::byte, PAGE_SIZE>(frame_->data_).first<PAGE_HEADER_SIZE>());
+	}
 
   private:
 	friend class BufferPoolManager;
@@ -130,11 +146,61 @@ class WritePageGuard {
 
 	[[nodiscard]] page_id_t PageId() const { return page_id_; }
 
-	[[nodiscard]] std::span<const std::byte, PAGE_SIZE> Data() const { return frame_->data_; }
-	[[nodiscard]] std::span<std::byte, PAGE_SIZE> MutableData() { return frame_->data_; }
+	[[nodiscard]] std::span<const std::byte, PAGE_BODY_SIZE> Body() const {
+		return std::span<const std::byte, PAGE_SIZE>(frame_->data_)
+		    .subspan<PAGE_HEADER_SIZE, PAGE_BODY_SIZE>();
+	}
+
+	// The only mutable view a caller ever gets, and it starts AFTER the header.
+	//
+	// This is what makes the miss-path validation in FetchFrame trustworthy rather than
+	// hopeful. If a caller could name all PAGE_SIZE bytes, then `memcpy(page, buf, PAGE_SIZE)`
+	// — the most natural thing in the world to write in a heap or B+tree layer — would
+	// overwrite page_id and page_type, and the page would fail validation on its next miss,
+	// long after the code that broke it ran. Handing out only the body means that line cannot
+	// be written. Same reasoning as guards existing at all: delete the class of bug rather
+	// than document it.
+	[[nodiscard]] std::span<std::byte, PAGE_BODY_SIZE> MutableBody() {
+		return std::span(frame_->data_).subspan<PAGE_HEADER_SIZE, PAGE_BODY_SIZE>();
+	}
+
+	[[nodiscard]] PageHeader Header() const {
+		return PageHeader::ReadFrom(
+		    std::span<const std::byte, PAGE_SIZE>(frame_->data_).first<PAGE_HEADER_SIZE>());
+	}
+
+	// The header fields a layer above owns, exposed one at a time rather than as a whole
+	// PageHeader. A SetHeader(const PageHeader&) would reopen exactly the hole this class
+	// closes — a caller could write a page_id that disagrees with the frame's.
+	//
+	// Deliberately absent: page_id and format_version belong to DiskManager and NewPage,
+	// checksum to whoever implements it, page_lsn to a WAL that does not exist. None of them
+	// are a caller's to set, so none of them have a setter.
+	void SetPageType(PageType type) {
+		MutateHeader([&](PageHeader& h) { h.page_type = type; });
+	}
+	void SetFlags(uint8_t flags) {
+		MutateHeader([&](PageHeader& h) { h.flags = flags; });
+	}
+	void SetNextPageId(page_id_t next) {
+		MutateHeader([&](PageHeader& h) { h.next_page_id = next; });
+	}
+	void SetPrevPageId(page_id_t prev) {
+		MutateHeader([&](PageHeader& h) { h.prev_page_id = prev; });
+	}
 
   private:
 	friend class BufferPoolManager;
+
+	// Read-modify-write of the 32 header bytes. Private, so the only way in is through the
+	// typed setters above — which is what keeps the fields a caller does not own untouchable.
+	template <typename Fn>
+	void MutateHeader(Fn&& fn) {
+		auto bytes = std::span(frame_->data_).first<PAGE_HEADER_SIZE>();
+		PageHeader header = PageHeader::ReadFrom(bytes);
+		fn(header);
+		header.WriteTo(bytes);
+	}
 
 	WritePageGuard(BufferPoolManager* bpm, Frame* frame, frame_id_t frame_id, page_id_t page_id,
 	               Frame::WriteLatch latch)
