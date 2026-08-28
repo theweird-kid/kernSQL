@@ -83,6 +83,15 @@ class Replacer {
 		return ClaimVictim();
 	}
 
+	// How many frames are currently eviction candidates. A diagnostic, not a decision input:
+	// the answer is stale the moment the lock is released, so nothing may branch on it. Evict()
+	// re-reads evictable_count_ under the same lock it evicts from, which is what makes *its*
+	// use of the value sound.
+	[[nodiscard]] std::size_t EvictableCount() const {
+		std::lock_guard<std::mutex> guard(mtx_);
+		return evictable_count_;
+	}
+
   private:
 	// Victim post-conditions (DD-002): leaves the candidate set and its usage_count resets
 	// to 0 before Evict returns. Requires mtx_ held with hand_ on an evictable frame.
@@ -99,7 +108,7 @@ class Replacer {
 
 	static constexpr uint8_t kMaxUsageCount = 3;  // resolved in DD-002
 
-	std::mutex mtx_;
+	mutable std::mutex mtx_;
 	std::vector<std::atomic_uint8_t> usage_count_;  // indexed by frame_id
 	std::vector<uint8_t> evictable_;                // 0/1 flags — deliberately not vector<bool>
 	std::size_t hand_ = 0;                          // single global hand (resolved in DD-002)

@@ -11,6 +11,7 @@
 
 #include "buffer/frame.hpp"
 #include "buffer/freelist.hpp"
+#include "buffer/pool_stats.hpp"
 #include "buffer/replacer.hpp"
 #include "common/logger.hpp"
 #include "common/page_header.hpp"
@@ -125,6 +126,44 @@ Status BufferPoolManager::Shutdown() {
 	Status sync = disk_manager_.Sync();  // unconditional
 	if (st.ok()) st = sync;
 	return st;
+}
+
+PoolStats BufferPoolManager::GetStats() const {
+	PoolStats stats{};
+	stats.capacity = capacity_;
+
+	const auto n = static_cast<frame_id_t>(capacity_);
+	for (frame_id_t frame_id = 0; frame_id < n; ++frame_id) {
+		const auto& frame = FrameAt(frame_id);
+
+		// One frame's mutex at a time, released before the next is taken. Never two at once,
+		// and no shard lock anywhere near this — a census that held locks across frames would
+		// be a new lock-ordering edge for a diagnostic, which is a bad trade.
+		std::lock_guard lock(frame.mtx_);
+		switch (frame.state_) {
+			case FrameState::Free:
+				++stats.free_frames;
+				break;
+			case FrameState::Loading:
+				++stats.loading_frames;
+				break;
+			case FrameState::Resident:
+				++stats.resident_frames;
+				break;
+			case FrameState::Failed:
+				++stats.failed_frames;
+				break;
+		}
+		if (frame.pin_count_ > 0) ++stats.pinned_frames;
+	}
+
+	// AFTER the loop, deliberately: DD-002 forbids calling into the free list or the replacer
+	// while holding a frame's metadata mutex. Both take their own leaf lock, so reading them
+	// here adds no ordering constraint.
+	stats.free_list_size = free_list_.Size();
+	stats.evictable = replacer_.EvictableCount();
+
+	return stats;
 }
 
 void BufferPoolManager::UnpinPage(frame_id_t frame_id) {
@@ -301,8 +340,8 @@ Result<frame_id_t> BufferPoolManager::FetchFrame(page_id_t page_id) {
 			Status bad =
 			    (header.page_type == PageType::FREE)
 			        ? Status::InvalidArgument(std::format("page {} is not allocated", page_id))
-			        : Status::Corruption(std::format("page {} header claims to be page {}",
-			                                         page_id, header.page_id));
+			        : Status::Corruption(std::format("page {} header claims to be page {}", page_id,
+			                                         header.page_id));
 			// Same disposal path as a read error: the frame is Loading, mapped and pinned, and
 			// may have waiters asleep on it. Waiters get the generic Failed-path error rather
 			// than this one — a pre-existing property of that path, not new here.

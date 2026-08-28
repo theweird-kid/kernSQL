@@ -177,29 +177,38 @@ class WritePageGuard {
 	// checksum to whoever implements it, page_lsn to a WAL that does not exist. None of them
 	// are a caller's to set, so none of them have a setter.
 	void SetPageType(PageType type) {
-		MutateHeader([&](PageHeader& h) { h.page_type = type; });
+		PageHeader header = Header();
+		header.page_type = type;
+		WriteHeader(header);
 	}
 	void SetFlags(uint8_t flags) {
-		MutateHeader([&](PageHeader& h) { h.flags = flags; });
+		PageHeader header = Header();
+		header.flags = flags;
+		WriteHeader(header);
 	}
 	void SetNextPageId(page_id_t next) {
-		MutateHeader([&](PageHeader& h) { h.next_page_id = next; });
+		PageHeader header = Header();
+		header.next_page_id = next;
+		WriteHeader(header);
 	}
 	void SetPrevPageId(page_id_t prev) {
-		MutateHeader([&](PageHeader& h) { h.prev_page_id = prev; });
+		PageHeader header = Header();
+		header.prev_page_id = prev;
+		WriteHeader(header);
 	}
 
   private:
 	friend class BufferPoolManager;
 
-	// Read-modify-write of the 32 header bytes. Private, so the only way in is through the
-	// typed setters above — which is what keeps the fields a caller does not own untouchable.
-	template <typename Fn>
-	void MutateHeader(Fn&& fn) {
-		auto bytes = std::span(frame_->data_).first<PAGE_HEADER_SIZE>();
-		PageHeader header = PageHeader::ReadFrom(bytes);
-		fn(header);
-		header.WriteTo(bytes);
+	// Private, so the only way to write the header is through the typed setters above — which
+	// is what keeps the fields a caller does not own untouchable.
+	//
+	// Deliberately not a template taking a lambda. Inside a member template, `.first<N>()` on
+	// a CTAD-deduced span is treated as a dependent template name by GCC and needs a
+	// `template` disambiguator; clang accepts it without. A portability trap is a bad price
+	// for saving two lines per setter.
+	void WriteHeader(const PageHeader& header) {
+		header.WriteTo(std::span(frame_->data_).first<PAGE_HEADER_SIZE>());
 	}
 
 	WritePageGuard(BufferPoolManager* bpm, Frame* frame, frame_id_t frame_id, page_id_t page_id,

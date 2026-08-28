@@ -8,6 +8,7 @@
 #include "buffer/freelist.hpp"
 #include "buffer/page_guard.hpp"
 #include "buffer/page_table.hpp"
+#include "buffer/pool_stats.hpp"
 #include "buffer/replacer.hpp"
 #include "common/status.hpp"
 #include "common/types.hpp"
@@ -104,6 +105,10 @@ class BufferPoolManager {
 	// that a guard outlived the pool; assert on it rather than working around it.
 	[[nodiscard]] Status Shutdown();
 
+	// Pool census. See PoolStats above for its two caveats — O(capacity), and a sample rather
+	// than a snapshot.
+	[[nodiscard]] PoolStats GetStats() const;
+
   private:
 	// The guards construct themselves through this class's private constructors and call
 	// UnpinPage below on release, so the friendship goes both ways.
@@ -177,6 +182,11 @@ class BufferPoolManager {
 	Status FlushFrame(frame_id_t frame_id, page_id_t page_id);
 
 	[[nodiscard]] Frame& FrameAt(frame_id_t frame_id) {
+		assert(frame_id >= 0 && static_cast<std::size_t>(frame_id) < capacity_);
+		return frames_[static_cast<std::size_t>(frame_id)];
+	}
+
+	[[nodiscard]] const Frame& FrameAt(frame_id_t frame_id) const {
 		assert(frame_id >= 0 && static_cast<std::size_t>(frame_id) < capacity_);
 		return frames_[static_cast<std::size_t>(frame_id)];
 	}

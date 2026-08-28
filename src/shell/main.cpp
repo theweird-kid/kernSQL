@@ -22,6 +22,7 @@
 
 #include "buffer/buffer_pool_manager.hpp"
 #include "buffer/page_guard.hpp"
+#include "buffer/pool_stats.hpp"
 #include "common/status.hpp"
 #include "common/types.hpp"
 #include "storage/disk_manager.hpp"
@@ -145,7 +146,13 @@ bool Dispatch(BufferPoolManager& bpm, DiskManager& dm, std::string_view line) {
 	} else if (cmd == "new") {
 		CmdNew(bpm);
 	} else if (cmd == "stat") {
-		std::println("stat: {} pages on disk, pool holds {} frames", dm.PageCount(), kPoolFrames);
+		const PoolStats st = bpm.GetStats();
+		std::println("stat: {} pages on disk", dm.PageCount());
+		std::println("      frames {}: {} free / {} resident / {} loading / {} failed",
+		             st.capacity, st.free_frames, st.resident_frames, st.loading_frames,
+		             st.failed_frames);
+		std::println("      {} pinned, {} evictable, free list holds {}", st.pinned_frames,
+		             st.evictable, st.free_list_size);
 	} else if (cmd == "flushall") {
 		PrintStatus("flushall", bpm.FlushAllPages());
 	} else if (cmd == "write") {

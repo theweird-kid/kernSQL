@@ -105,7 +105,11 @@ struct alignas(64) Frame {
 	std::atomic<uint64_t> flushed_epoch_{0};
 
 	// --- Everything below is guarded by mtx_ ---
-	std::mutex mtx_;
+	//
+	// mutable so that an observer which only *reads* frame state — BufferPoolManager::GetStats
+	// — can still be const. Locking a mutex is not a logical mutation of the object, which is
+	// exactly the case `mutable` exists for; FreeList::mtx_ is mutable for the same reason.
+	mutable std::mutex mtx_;
 	FrameState state_{FrameState::Free};
 	page_id_t page_id_{INVALID_PAGE};  // INVALID_PAGE iff state_ == Free.
 	int32_t pin_count_{0};             // a claim on this frame's identity — DD-002, "The pin
