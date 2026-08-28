@@ -324,8 +324,17 @@ Status DiskManager::write_page_header(page_id_t page_id, const PageHeader& heade
 		return Status::InvalidArgument(
 		    std::format("invalid page id {} for write, page id <= {}", page_id, this->page_count_.load()));
 	}
+	// Identity is stamped HERE, not by callers. Five sites write headers (both reserved pages
+	// in Open, AllocatePage, DeallocatePage, persist_freelist_head) and every one of them owes
+	// the same two fields. A page whose header does not carry its own id is indistinguishable
+	// from a page that landed at the wrong offset, so a single forgetful caller silently
+	// disables the check for that page forever. One place that knows beats five that remember.
+	PageHeader stamped = header;
+	stamped.page_id = page_id;
+	stamped.format_version = PAGE_FORMAT_VERSION;
+
 	std::array<std::byte, PAGE_HEADER_SIZE> buf;
-	header.WriteTo(buf);
+	stamped.WriteTo(buf);
 	if (Status s = full_write(PageOffset(page_id), buf); !s.ok()) {
 		LOG_DEBUG("failed to write page header for page %d", page_id);
 		return s;

@@ -15,7 +15,13 @@ inline constexpr page_id_t INVALID_PAGE = -1;
 inline constexpr page_id_t META_PAGE_ID = 0;          // reserved superblock page; never allocatable
 inline constexpr page_id_t CATALOG_ROOT_PAGE_ID = 1;  // reserved page for catalog root
 inline constexpr std::size_t PAGE_SIZE = 4096;
-inline constexpr std::size_t PAGE_HEADER_SIZE = 24;
+inline constexpr std::size_t PAGE_HEADER_SIZE = 32;
+
+// Bumped whenever the on-disk layout of PageHeader changes in a way an older build would
+// misread. Stamped into every header DiskManager writes; nothing reads it back yet, which is
+// the point — it exists so that a future format change has a discriminator to branch on
+// instead of guessing.
+inline constexpr uint16_t PAGE_FORMAT_VERSION = 1;
 
 struct RID {
 	page_id_t page_id{INVALID_PAGE};

@@ -12,6 +12,7 @@
 #include "buffer/freelist.hpp"
 #include "buffer/replacer.hpp"
 #include "common/logger.hpp"
+#include "common/page_header.hpp"
 #include "common/status.hpp"
 #include "common/types.hpp"
 
@@ -407,4 +408,163 @@ Result<frame_id_t> BufferPoolManager::ReclaimFrame() {
 		// that already holds a shard lock or a metadata mutex.
 		UnpinPage(victim.value());
 	}
+}
+
+void BufferPoolManager::AbandonLoad(frame_id_t frame_id, page_id_t page_id) {
+	{
+		auto shard = page_table_.AcquireShard(page_id);
+		shard.Erase(page_id);
+	}
+
+	auto& frame = FrameAt(frame_id);
+	{
+		std::unique_lock<std::mutex> lock(frame.mtx_);
+		frame.state_ = FrameState::Failed;
+		frame.cv_.notify_all();
+
+		assert(frame.page_id_ >= 1);
+		frame.cv_.wait(lock, [&] { return frame.pin_count_ == 1; });
+
+		frame.page_id_ = INVALID_PAGE;
+		frame.state_ = FrameState::Free;
+		frame.pin_count_ = 0;
+		frame.ResetEpochs();
+	}
+
+	free_list_.Push(frame_id);
+}
+
+Result<ReadPageGuard> BufferPoolManager::FetchPageRead(page_id_t page_id) {
+	auto frame_found = FetchFrame(page_id);
+	if (!frame_found.has_value()) return std::unexpected(frame_found.error());
+
+	auto& frame = FrameAt(frame_found.value());
+
+	return ReadPageGuard(this, &frame, frame_found.value(), page_id, frame.AcquireRead());
+}
+
+Result<WritePageGuard> BufferPoolManager::FetchPageWrite(page_id_t page_id) {
+	auto frame_found = FetchFrame(page_id);
+	if (!frame_found.has_value()) return std::unexpected(frame_found.error());
+
+	auto& frame = FrameAt(frame_found.value());
+
+	return WritePageGuard(this, &frame, frame_found.value(), page_id, frame.AcquireWrite());
+}
+
+Result<WritePageGuard> BufferPoolManager::NewPage() {
+	auto frame_found = AcquireFrame();
+	if (!frame_found.has_value()) {
+		return std::unexpected(frame_found.error());
+	}
+
+	auto page_allocated = disk_manager_.AllocatePage();
+	if (!page_allocated.has_value()) {
+		free_list_.Push(frame_found.value());  // cleanup the acquired frame
+		return std::unexpected(page_allocated.error());
+	}
+
+	page_id_t page_id = page_allocated.value();
+
+	auto& frame = FrameAt(frame_found.value());
+	// No frame locks required as this is private to this thread
+	frame.page_id_ = page_id;
+	frame.state_ = FrameState::Resident;
+	frame.pin_count_ = 1;
+	frame.data_.fill(std::byte{0});
+
+	// Stamp the page's own identity. Zeroing left page_id at 0 — which is META_PAGE_ID — and a
+	// page that lies about which page it is defeats the entire point of storing the id.
+	// DiskManager stamps this on every header it writes; NewPage is the one path that produces
+	// page contents without ever reading them, so it owes the same. page_type is ALLOCATED, the
+	// "handed out but not yet given a purpose" state (InnoDB spells it FIL_PAGE_TYPE_ALLOCATED),
+	// matching what AllocatePage already stamped on disk. Everything past the header stays the
+	// caller's business (DD-003) — this is identity, not semantics.
+	PageHeader header;
+	header.page_type = PageType::ALLOCATED;
+	header.page_id = page_id;
+	header.WriteTo(std::span(frame.data_).first<PAGE_HEADER_SIZE>());
+	frame.ResetEpochs();
+
+	{
+		auto shard = page_table_.AcquireShard(page_id);
+		shard.Insert(page_id, frame_found.value());
+	}
+
+	replacer_.RecordAccess(frame_found.value());
+
+	return WritePageGuard(this, &frame, frame_found.value(), page_id, frame.AcquireWrite());
+}
+
+Status BufferPoolManager::DeletePage(page_id_t page_id) {
+	// Checked BEFORE anything destructive. DeallocatePage rejects these two ids, and reaching
+	// that rejection at the end of this function would mean we had already vacated the frame —
+	// evicting the catalog root from the pool and returning an error, for a call that could
+	// never have succeeded. Failing here leaves nothing to undo.
+	if (page_id == META_PAGE_ID || page_id == CATALOG_ROOT_PAGE_ID) {
+		return Status::InvalidArgument(
+		    std::format("page {} is reserved and cannot be deleted", page_id));
+	}
+
+	// -1 means "not cached" — the page may legitimately have no frame, in which case there is
+	// nothing to vacate and only the disk side needs doing.
+	frame_id_t frame_id{-1};
+	{
+		auto shard = page_table_.AcquireShard(page_id);
+		auto found = shard.Find(page_id);
+
+		if (found.has_value()) {
+			frame_id = *found;
+			auto& frame = FrameAt(frame_id);
+			std::lock_guard lock(frame.mtx_);  // shard -> metadata, the canonical order
+
+			// Reject rather than wait. Waiting would deadlock outright when the caller is
+			// deleting a page it still holds a guard on, and nothing at this layer detects
+			// that. It also fires spuriously while a reclaimer holds a transient pin across a
+			// dirty victim's writeback (DD-002, "Known behaviour") — that case is retryable and
+			// this one is not, and a single status cannot tell the caller which it hit.
+			//
+			// The pin check subsumes a state check: Loading and Failed frames both carry at
+			// least the loader's own pin, so neither can reach the vacate below.
+			if (frame.pin_count_ != 0) {
+				return Status::InvalidArgument(
+				    std::format("page {} is pinned ({} holders) and cannot be deleted", page_id,
+				                frame.pin_count_));
+			}
+			assert(frame.state_ == FrameState::Resident);
+
+			// Dirty contents are discarded WITHOUT a flush, deliberately. Flushing would write
+			// bytes into a page we are about to stamp FREE, and race that stamp while doing it.
+			// This is the one place in the component where a dirty frame owes no writeback.
+			frame.page_id_ = INVALID_PAGE;
+			frame.state_ = FrameState::Free;
+			frame.ResetEpochs();
+			shard.Erase(page_id);
+		}
+	}  // both released
+
+	if (frame_id != -1) {
+		// Mandatory, and the only place in the component that needs it. A Resident frame with
+		// pin_count == 0 is in the replacer's candidate set by definition, so pushing it to the
+		// free list while it is still a candidate would leave it in both structures — and
+		// TryPop and Evict could then hand the same frame to two threads. Every other path that
+		// frees a frame gets one that already left the set: Evict removed ReclaimFrame's, and
+		// AbandonLoad's was never in it.
+		replacer_.SetEvictable(frame_id, false);
+	}
+
+	// Vacated first, which is what satisfies DeallocatePage's not-resident contract
+	// (disk_manager.hpp). It stamps the on-disk header FREE directly, and a later flush of a
+	// still-resident frame would write the old header back over that stamp — leaving a page
+	// that is on the disk freelist and reachable as live data at the same time. Once the frame
+	// is Free, FlushAllPages skips it, so no flush can ever reach this page again.
+	Status st = disk_manager_.DeallocatePage(page_id);
+
+	// Returned regardless of the deallocation result. The frame is already Free, unmapped and
+	// out of the candidate set, so it is usable stock either way; withholding it because the
+	// disk call failed would shrink the pool permanently for a reason that has nothing to do
+	// with the frame.
+	if (frame_id != -1) free_list_.Push(frame_id);
+
+	return st;
 }
