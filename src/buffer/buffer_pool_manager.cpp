@@ -538,10 +538,20 @@ Result<WritePageGuard> BufferPoolManager::NewPage() {
 	page_id_t page_id = page_allocated.value();
 
 	auto& frame = FrameAt(frame_found.value());
-	// No frame locks required as this is private to this thread
-	frame.page_id_ = page_id;
-	frame.state_ = FrameState::Resident;
-	frame.pin_count_ = 1;
+	{
+		// The frame is unreachable through the page table and the replacer, so no other
+		// FETCHER can find it -- but GetStats walks every frame BY INDEX and reads state_ and
+		// pin_count_ under this mutex, so "private to this thread" does not cover it. Without
+		// the lock these three stores race a concurrent census. FetchFrame's miss path takes
+		// the same lock for the same stores.
+		std::lock_guard lock(frame.mtx_);
+		frame.page_id_ = page_id;
+		frame.state_ = FrameState::Resident;
+		frame.pin_count_ = 1;
+	}
+
+	// data_ needs no lock: nothing can reach this frame's bytes until the mapping is published
+	// below, and a guard only ever comes from a successful page-table lookup.
 	frame.data_.fill(std::byte{0});
 
 	// Stamp the page's own identity. Zeroing left page_id at 0 — which is META_PAGE_ID — and a

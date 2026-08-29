@@ -4,16 +4,22 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
+#include <format>
 #include <latch>
 #include <memory>
+#include <mutex>
+#include <random>
+#include <set>
 #include <span>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "buffer/page_guard.hpp"
@@ -615,11 +621,6 @@ TEST_F(BufferPoolManagerTest, FailedLoadWakesEveryWaiter) {
 				gate.arrive_and_wait();
 				auto page = bpm_->FetchPageRead(victim);
 
-				// No gtest assertion in here. ASSERT_* expands to a bare `return;`, which would
-				// return from this lambda rather than from the test, and a fatal failure raised
-				// off the main thread does not stop the test anyway. Record; assert after the
-				// join. The guard, if one were wrongly handed out, dies at this brace -- before
-				// the join, so the census below sees no pins.
 				results[i] = page.has_value() ? Status::OK() : page.error();
 			});
 		}
@@ -681,20 +682,231 @@ TEST_F(BufferPoolManagerTest, FailedLoadWakesEveryWaiter) {
 
 // N threads fetching one page. All must see identical bytes, and only one frame may be used.
 TEST_F(BufferPoolManagerTest, ConcurrentFetchesOfOnePageShareOneFrame) {
-	GTEST_SKIP() << "TODO";
+	std::string data{"all must see this"};
+	page_id_t page_id = SeedPage(data);
+
+	size_t kThreads{32};
+	std::vector<std::thread> threads;
+	threads.reserve(kThreads);
+
+	std::latch gate(static_cast<std::ptrdiff_t>(kThreads));
+	std::vector<std::string> read_value(kThreads);
+
+	for (size_t i = 0; i < kThreads; i++) {
+		threads.emplace_back([&, i] {
+			gate.arrive_and_wait();
+			auto read_page = bpm_->FetchPageRead(page_id);
+			read_value[i] = read_page.has_value()
+			                    ? AsChars(read_page.value().Body().subspan(0, data.size()))
+			                    : "something else";
+		});
+	}
+
+	for (auto& t : threads) t.join();
+	for (size_t i = 0; i < kThreads; i++) {
+		EXPECT_EQ(data, read_value[i]);
+	}
+
+	ASSERT_EQ(bpm_->GetStats().resident_frames, 1);  // every thread pins the page to a single frame
+	AssertQuiesced("after releasing all guards");
 }
 
 // N threads fetching randomly from a working set larger than the pool, so the replacer is
 // under constant pressure. Assert every read returns that page's own seeded bytes -- a frame
 // handed to two threads shows up as one thread reading another page's content.
 TEST_F(BufferPoolManagerTest, ConcurrentFetchesUnderPressureNeverCrossPages) {
-	GTEST_SKIP() << "TODO";
+	// The working set is six times the pool, so almost every fetch is a miss and the replacer
+	// is evicting continuously -- which is the state this test needs. A working set that fits
+	// would make every fetch a cache hit and prove nothing about reclaim.
+	constexpr std::size_t kWorkingSet = 24;
+	constexpr std::size_t kThreads = 8;
+	constexpr std::size_t kIterations = 500;
+	constexpr std::uint32_t kSeed = 0x5EED;
+
+	// Each page carries its own index in its body, so a thread that is handed the wrong frame
+	// reads a string that names the page it actually got. The failure message can then print
+	// both sides instead of "some bytes differed".
+	std::vector<page_id_t> page_ids;
+	std::vector<std::string> expected;
+	for (std::size_t i = 0; i < kWorkingSet; ++i) {
+		expected.push_back(std::format("data for page {}", i));
+		const page_id_t id = SeedPage(expected.back());
+		ASSERT_NE(id, INVALID_PAGE);
+		page_ids.push_back(id);
+	}
+
+	// One record per thread, written only by that thread and read only after the join, so
+	// nothing here needs a lock. Counts plus the FIRST bad observation: a crossed read under
+	// this much pressure would repeat thousands of times, and one well-described instance is
+	// worth more than a flood.
+	struct Outcome {
+		std::size_t ok{0};
+		std::size_t pool_full{0};
+		std::size_t crossings{0};
+		page_id_t crossed_page{INVALID_PAGE};
+		std::string want;
+		std::string got;
+		Status unexpected = Status::OK();
+	};
+	std::vector<Outcome> outcomes(kThreads);
+
+	std::latch gate(static_cast<std::ptrdiff_t>(kThreads));
+	std::vector<std::thread> threads;
+	threads.reserve(kThreads);
+
+	for (std::size_t i = 0; i < kThreads; ++i) {
+		threads.emplace_back([&, i] {
+			// Per-thread generator. std::mt19937 is not thread-safe -- drawing from one shared
+			// engine is every thread mutating the same internal state, which is both a data
+			// race TSan will report and a quiet correlation of the streams. Seeded from a fixed
+			// base plus the thread index rather than random_device, so a failure reproduces.
+			std::mt19937 gen(kSeed + static_cast<std::uint32_t>(i));
+			std::uniform_int_distribution<std::size_t> pick(0, kWorkingSet - 1);
+
+			Outcome& out = outcomes[i];
+			gate.arrive_and_wait();
+
+			for (std::size_t n = 0; n < kIterations; ++n) {
+				const std::size_t idx = pick(gen);
+				auto page = bpm_->FetchPageRead(page_ids[idx]);
+
+				if (!page.has_value()) {
+					// Legal and expected: kThreads guards contend for kFrames frames, so a
+					// thread that finds the free list empty with every frame pinned is told the
+					// pool is full. Any OTHER error is a real failure -- recorded, not asserted,
+					// because a gtest fatal assertion off the main thread would only return
+					// from this lambda.
+					if (page.error().code() == ErrorCode::kBufferPoolFull) {
+						++out.pool_full;
+					} else if (out.unexpected.ok()) {
+						out.unexpected = page.error();
+					}
+					continue;
+				}
+				++out.ok;
+
+				// The whole point. A frame handed to two threads at once shows up here as one
+				// of them reading a different page's bytes under this page's id.
+				std::string body = ReadBody(page->Body());
+				if (body != expected[idx]) {
+					if (out.crossings == 0) {
+						out.crossed_page = page_ids[idx];
+						out.want = expected[idx];
+						out.got = std::move(body);
+					}
+					++out.crossings;
+				}
+			}  // guard drops here, before the next iteration -- one pin per thread at a time
+		});
+	}
+	for (auto& t : threads) t.join();
+
+	std::size_t total_ok = 0, total_full = 0, total_crossed = 0;
+	for (std::size_t i = 0; i < kThreads; ++i) {
+		const Outcome& out = outcomes[i];
+		total_ok += out.ok;
+		total_full += out.pool_full;
+		total_crossed += out.crossings;
+
+		EXPECT_TRUE(out.unexpected.ok())
+		    << "thread " << i
+		    << " got an error that is not kBufferPoolFull: " << out.unexpected.message();
+		EXPECT_EQ(out.crossings, 0u)
+		    << "thread " << i << " read page " << out.crossed_page << " and got another page's "
+		    << "bytes -- want \"" << out.want << "\", got \"" << out.got << "\"";
+	}
+
+	// Not a property of the pool, a guard against the test quietly doing nothing: if every
+	// fetch were rejected, the per-thread loop above would pass without having read a byte.
+	EXPECT_GT(total_ok, 0u) << "every fetch failed; this run proved nothing";
+	EXPECT_EQ(total_crossed, 0u);
+
+	RecordProperty("fetches_ok", static_cast<int>(total_ok));
+	RecordProperty("fetches_pool_full", static_cast<int>(total_full));
+
+	AssertQuiesced("after concurrent pressure");
 }
 
 // N threads calling NewPage. Every returned page id must be distinct. This is the test that
 // catches a duplicate page-table mapping, which today aborts inside ShardGuard::Insert.
 TEST_F(BufferPoolManagerTest, ConcurrentNewPageReturnsDistinctPages) {
-	GTEST_SKIP() << "TODO";
+	constexpr std::size_t kThreads = 32;
+
+	// One slot per thread: the page id on success, the error otherwise. Deliberately not a
+	// shared set behind a mutex -- that lock would serialise the threads at precisely the
+	// moment they are supposed to collide, and merging after the join costs nothing.
+	struct Outcome {
+		page_id_t page_id{INVALID_PAGE};
+		Status status = Status::OK();
+	};
+	std::vector<Outcome> outcomes(kThreads);
+
+	const page_id_t pages_before = dm_->PageCount();
+	std::latch gate(static_cast<std::ptrdiff_t>(kThreads));
+
+	// A reader for the frame metadata NewPage publishes, and a deliberate part of the test
+	// rather than scaffolding. Without it this race is INVISIBLE: a frame taken off the free
+	// list is unreachable through both the page table and the replacer, so no allocating
+	// thread ever touches another's frame and TSan only ever sees one side of the access.
+	// GetStats is a genuine concurrent caller -- any metrics endpoint does exactly this -- and
+	// it walks every frame by index under each frame's metadata mutex, which is the reader
+	// NewPage's stores have to be paired against.
+	std::atomic<bool> sampling{true};
+	std::thread sampler([&] {
+		while (sampling.load(std::memory_order_relaxed)) (void)bpm_->GetStats();
+	});
+
+	std::vector<std::thread> threads;
+	threads.reserve(kThreads);
+	for (std::size_t i = 0; i < kThreads; ++i) {
+		threads.emplace_back([&, i] {
+			gate.arrive_and_wait();
+			auto page = bpm_->NewPage();
+			if (page.has_value()) {
+				outcomes[i].page_id = page->PageId();
+			} else {
+				outcomes[i].status = page.error();
+			}
+		});  // the guard dies here, before the join, so no pin outlives the census below
+	}
+	for (auto& t : threads) t.join();
+	sampling.store(false, std::memory_order_relaxed);
+	sampler.join();
+
+	std::set<page_id_t> distinct;
+	std::size_t granted = 0;
+	for (std::size_t i = 0; i < kThreads; ++i) {
+		const Outcome& out = outcomes[i];
+		if (out.page_id == INVALID_PAGE) {
+			// kThreads threads contend for kFrames frames and each holds its guard for the
+			// length of the call, so most of these are refused. That is the pool working, not
+			// failing -- but any OTHER code is a real bug.
+			EXPECT_EQ(out.status.code(), ErrorCode::kBufferPoolFull)
+			    << "thread " << i << ": " << out.status.message();
+			continue;
+		}
+		++granted;
+		distinct.insert(out.page_id);
+	}
+
+	// Distinctness is the property that holds under EVERY interleaving. The count is not:
+	// asserting granted == kThreads would be asserting on the scheduler, and it fails the
+	// moment the threads genuinely overlap. A duplicate would also abort inside
+	// ShardGuard::Insert before reaching here -- this is the softer variant of that backstop.
+	EXPECT_EQ(distinct.size(), granted) << "two threads were handed the same page id";
+
+	// Guards against a run where every call was refused, which would make the check above
+	// vacuously true. At least one thread always wins: the free list is full at the start.
+	EXPECT_GT(granted, 0u) << "every NewPage was refused; this run proved nothing";
+
+	// The allocator and the pool must agree. A refused NewPage must consume no page id -- it
+	// acquires its frame BEFORE calling AllocatePage, so there is nothing to unwind -- and a
+	// granted one must consume exactly one.
+	EXPECT_EQ(static_cast<std::size_t>(dm_->PageCount() - pages_before), granted)
+	    << "the disk allocator and the pool disagree about how many pages were handed out";
+
+	RecordProperty("new_pages_granted", static_cast<int>(granted));
+	AssertQuiesced("after concurrent NewPage");
 }
 
 // One thread deleting while others fetch the same page. Each operation must either succeed
