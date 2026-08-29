@@ -5,12 +5,15 @@
 #include <algorithm>
 #include <array>
 #include <cstddef>
+#include <cstdint>
 #include <cstring>
 #include <filesystem>
+#include <latch>
 #include <memory>
 #include <span>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 #include "buffer/page_guard.hpp"
@@ -118,8 +121,7 @@ class BufferPoolManagerTest : public ::testing::Test {
 	// Success only if every byte is zero, naming the first offset that is not. A bare EXPECT
 	// over 4064 bytes either says nothing useful or says it 4064 times.
 	static ::testing::AssertionResult AllZero(std::span<const std::byte> bytes) {
-		const auto it =
-		    std::ranges::find_if(bytes, [](std::byte b) { return b != std::byte{0}; });
+		const auto it = std::ranges::find_if(bytes, [](std::byte b) { return b != std::byte{0}; });
 		if (it == bytes.end()) return ::testing::AssertionSuccess();
 		return ::testing::AssertionFailure()
 		       << "byte " << (it - bytes.begin()) << " of " << bytes.size() << " is "
@@ -465,26 +467,78 @@ TEST_F(BufferPoolManagerTest, DeletePageReturnsTheFrameAndLeavesTheCandidateSet)
 
 // Dirty several pages, call FlushAllPages once, verify every one of them on disk.
 TEST_F(BufferPoolManagerTest, FlushAllPagesWritesEveryDirtyPage) {
-	GTEST_SKIP() << "TODO";
+	std::vector<page_id_t> pages;
+	std::string dirty_payload{"dirty the page"};
+	for (size_t i = 0; i < kFrames; i++) {
+		auto np = bpm_->NewPage();
+		ASSERT_TRUE(np.has_value());
+		pages.push_back(np.value().PageId());
+		WriteBody(np.value(), dirty_payload);
+	}
+
+	auto st = bpm_->FlushAllPages();
+	ASSERT_EQ(st.code(), ErrorCode::kOk);
+
+	// verify the content
+	for (auto pg_id : pages) {
+		std::string disk_read_value = ReadBodyFromDisk(pg_id);
+		EXPECT_EQ(disk_read_value, dirty_payload);
+	}
+
+	AssertQuiesced("after flush pages and read");
 }
 
 // Two Shutdown() calls in a row: the second is a no-op returning OK, not a second flush and
 // not an error.
 TEST_F(BufferPoolManagerTest, ShutdownIsIdempotent) {
-	GTEST_SKIP() << "TODO";
+	auto st1 = bpm_->Shutdown();
+	EXPECT_EQ(st1.code(), ErrorCode::kOk);
+	auto st2 = bpm_->Shutdown();
+	EXPECT_EQ(st2.code(), ErrorCode::kOk);
+
+	AssertQuiesced("after shutdown");
 }
 
 // Write through the pool, Shutdown, destroy both manager and DiskManager, reopen the same
 // path, read back. The end-to-end durability claim -- and the only test that would catch
 // Shutdown flushing but never fsyncing.
 TEST_F(BufferPoolManagerTest, DataSurvivesShutdownAndReopen) {
-	GTEST_SKIP() << "TODO";
+	std::vector<page_id_t> pages;
+	std::string payload{"something"};
+	for (size_t i = 0; i < 2 * kFrames; i++) {
+		auto pg = bpm_->NewPage();
+		ASSERT_TRUE(pg.has_value());
+		pages.push_back(pg.value().PageId());
+		WriteBody(pg.value(), payload);
+	}
+	auto st = bpm_->Shutdown();
+	EXPECT_EQ(st.code(), ErrorCode::kOk);
+
+	bpm_.reset();
+	dm_.reset();
+
+	auto tmp_dm = DiskManager::Open(path_).value();
+	dm_ = std::move(tmp_dm);
+	bpm_ = std::make_unique<BufferPoolManager>(*dm_, kFrames);
+
+	for (page_id_t page_id : pages) {
+		auto pg = bpm_->FetchPageRead(page_id);
+		ASSERT_TRUE(pg.has_value());
+		EXPECT_EQ(AsChars(pg.value().Body().subspan(0, payload.size())), payload);
+	}
 }
 
 // Fetching a page id past the end of the file must fail cleanly. The real assertion is
 // AssertQuiesced: the frame acquired for the load has to come back.
 TEST_F(BufferPoolManagerTest, FetchPastEndOfFileLeaksNothing) {
-	GTEST_SKIP() << "TODO";
+	for (size_t i = 0; i < kFrames; i++) {
+		auto write_page = bpm_->NewPage();
+		EXPECT_TRUE(write_page.has_value());
+	}
+
+	auto pg = bpm_->FetchPageRead(kFrames * 3);
+	ASSERT_FALSE(pg.has_value());
+	ASSERT_EQ(pg.error().code(), ErrorCode::kInvalidArgument);
 }
 
 // --- Tier 2: the failed-load path. Nothing below has ever run. ---
@@ -494,7 +548,23 @@ TEST_F(BufferPoolManagerTest, FetchPastEndOfFileLeaksNothing) {
 // Assert the error surfaces and the frame is back -- that is the pin_count == 0 half of
 // AbandonLoad's disposal, which was wrong once already.
 TEST_F(BufferPoolManagerTest, FailedLoadReturnsErrorAndReclaimsTheFrame) {
-	GTEST_SKIP() << "TODO";
+	page_id_t page_id{INVALID_PAGE};
+	{
+		auto write_page = bpm_->NewPage();
+		ASSERT_TRUE(write_page.has_value());
+		page_id = write_page.value().PageId();
+		WriteBody(write_page.value(), "some data that should get lost");
+	}
+	FillPool();
+
+	std::filesystem::resize_file(
+	    path_, static_cast<size_t>(page_id) * PAGE_SIZE);  // truncate from this page onwards
+
+	auto read_page = bpm_->FetchPageRead(page_id);
+	ASSERT_FALSE(read_page.has_value());
+	ASSERT_EQ(read_page.error().code(), ErrorCode::kCorruption);
+
+	AssertQuiesced("after failed load");
 }
 
 // The same, with several threads fetching the SAME page so some are asleep on Loading when
@@ -503,7 +573,103 @@ TEST_F(BufferPoolManagerTest, FailedLoadReturnsErrorAndReclaimsTheFrame) {
 // whole after joining. If the notify is ever dropped this test hangs rather than fails, so
 // give it a timeout.
 TEST_F(BufferPoolManagerTest, FailedLoadWakesEveryWaiter) {
-	GTEST_SKIP() << "TODO";
+	// Fixed, not hardware_concurrency(): that is allowed to return 0, which would spawn no
+	// threads and pass vacuously, and it would otherwise make the laptop and CI run different
+	// tests. Rounds, because a single round is one sample of one interleaving.
+	constexpr std::size_t kThreads = 8;
+	constexpr std::size_t kRounds = 32;
+
+	// Victims are seeded straight through DiskManager, so they exist on disk and were never
+	// resident: every fetch below is a guaranteed miss that reaches the file. Creating them
+	// with NewPage instead would need each one evicted first, and evicting a dirty page
+	// rewrites it -- re-extending the very file this test is about to truncate.
+	std::vector<page_id_t> victims;
+	for (std::size_t i = 0; i < kRounds; ++i) {
+		const page_id_t id = SeedPage("");
+		ASSERT_NE(id, INVALID_PAGE);
+		victims.push_back(id);
+	}
+
+	// From the first victim onwards. Everything below it -- the meta page and the catalog root
+	// -- survives, so TearDown's Shutdown still has a well-formed file underneath it.
+	std::filesystem::resize_file(path_, static_cast<std::uintmax_t>(victims.front()) * PAGE_SIZE);
+
+	std::size_t loads_observed = 0;
+	std::size_t waits_observed = 0;
+
+	for (const page_id_t victim : victims) {
+		// One slot per thread, sized before any thread starts. Each thread writes only its own
+		// index, so there is nothing to lock; aggregating happens on the main thread after the
+		// join. A shared counter here would need a mutex and would tell you less.
+		std::vector<Status> results(kThreads, Status::OK());
+
+		// Every thread blocks until the last one arrives, so they storm FetchPageRead together
+		// rather than trickling in after the loader has already failed and cleaned up. This is
+		// what makes a thread asleep on Loading likely at all.
+		std::latch gate(static_cast<std::ptrdiff_t>(kThreads));
+
+		std::vector<std::thread> threads;
+		threads.reserve(kThreads);
+		for (std::size_t i = 0; i < kThreads; ++i) {
+			threads.emplace_back([&, i] {
+				gate.arrive_and_wait();
+				auto page = bpm_->FetchPageRead(victim);
+
+				// No gtest assertion in here. ASSERT_* expands to a bare `return;`, which would
+				// return from this lambda rather than from the test, and a fatal failure raised
+				// off the main thread does not stop the test anyway. Record; assert after the
+				// join. The guard, if one were wrongly handed out, dies at this brace -- before
+				// the join, so the census below sees no pins.
+				results[i] = page.has_value() ? Status::OK() : page.error();
+			});
+		}
+		for (auto& t : threads) t.join();
+
+		for (std::size_t i = 0; i < kThreads; ++i) {
+			const Status& st = results[i];
+
+			// The invariant that always holds: a page whose bytes are gone is fetchable by
+			// nobody, whatever order the threads ran in.
+			EXPECT_FALSE(st.ok()) << "thread " << i << " got a guard for page " << victim
+			                      << ", which cannot be read";
+
+			// Three codes are legal, and which one a thread gets is decided by the interleaving
+			// -- asserting any single one of them would be asserting on a race:
+			//   kCorruption      the loader; its pread hit EOF on the truncated file
+			//   kIOError         a waiter; it slept on Loading and woke to find Failed
+			//   kBufferPoolFull  it lost the race for a frame -- the loader's frame is pinned
+			//                    and the rest are momentarily held by other retrying threads,
+			//                    so the replacer has no candidate to offer
+			// Anything else is the bug this test is looking for.
+			EXPECT_TRUE(st.code() == ErrorCode::kCorruption || st.code() == ErrorCode::kIOError ||
+			            st.code() == ErrorCode::kBufferPoolFull)
+			    << "thread " << i << " on page " << victim << ": " << st.message();
+
+			if (st.code() == ErrorCode::kCorruption) ++loads_observed;
+			if (st.code() == ErrorCode::kIOError) ++waits_observed;
+		}
+
+		// Per round rather than once at the end. Every thread has joined, so the pool really is
+		// quiescent and PoolStats is meaningful -- and a frame lost in round 3 is a failure in
+		// round 3, not an unexplained kBufferPoolFull in round 30.
+		AssertQuiesced("after a failed concurrent load");
+	}
+
+	// Guaranteed: the free list is full at the start of every round, so somebody always wins a
+	// frame, publishes the mapping and reaches the read.
+	EXPECT_GT(loads_observed, 0u) << "no thread ever got as far as the disk read";
+
+	// NOT asserted, deliberately. The failing read is one pread that returns in microseconds
+	// and there is no fault-injection hook to widen that window, so no amount of hammering can
+	// GUARANTEE a thread is asleep on Loading when Failed is published. Asserting on it would
+	// be asserting on a race -- the definition of a flaky test. Recorded instead, so a run that
+	// exercised the drain is distinguishable from one that did not.
+	RecordProperty("waiter_wakeups_observed", static_cast<int>(waits_observed));
+	if (waits_observed == 0) {
+		GTEST_LOG_(WARNING) << "no thread was ever asleep on Loading: the waiter drain, "
+		                       "UnpinPage's notify on Failed and AbandonLoad's pin_count == 1 "
+		                       "wait were NOT exercised in this run";
+	}
 }
 
 // --- Tier 3: concurrency. Run under TSan; these prove nothing on their own. ---

@@ -31,5 +31,7 @@ foreach(t ${TEST_SRCS})
   get_filename_component(name ${t} NAME_WE)
   add_executable(${name} ${t})
   target_link_libraries(${name} PRIVATE kernsql_lib GTest::gtest_main)
-  gtest_discover_tests(${name})
+  # A dropped condvar notify makes a concurrency test HANG rather than fail, and a hung test
+  # blocks the run forever instead of reporting. Generous because TSan is roughly 10x slower.
+  gtest_discover_tests(${name} PROPERTIES TIMEOUT 120)
 endforeach()
