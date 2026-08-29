@@ -2,6 +2,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstring>
@@ -102,6 +103,27 @@ class BufferPoolManagerTest : public ::testing::Test {
 		EXPECT_TRUE(dm_->ReadPage(page_id, page).ok());
 		const char* body = reinterpret_cast<const char*>(page.data() + PAGE_HEADER_SIZE);
 		return std::string(body, ::strnlen(body, PAGE_BODY_SIZE));
+	}
+
+	// The header as it is ON DISK, bypassing the pool -- the counterpart to ReadBodyFromDisk,
+	// and the only way to tell "the pool refused" from "the pool refused after already telling
+	// DiskManager to free the page".
+	PageHeader ReadHeaderFromDisk(page_id_t page_id) {
+		std::array<std::byte, PAGE_SIZE> page{};
+		EXPECT_TRUE(dm_->ReadPage(page_id, page).ok());
+		return PageHeader::ReadFrom(
+		    std::span<const std::byte, PAGE_SIZE>(page).first<PAGE_HEADER_SIZE>());
+	}
+
+	// Success only if every byte is zero, naming the first offset that is not. A bare EXPECT
+	// over 4064 bytes either says nothing useful or says it 4064 times.
+	static ::testing::AssertionResult AllZero(std::span<const std::byte> bytes) {
+		const auto it =
+		    std::ranges::find_if(bytes, [](std::byte b) { return b != std::byte{0}; });
+		if (it == bytes.end()) return ::testing::AssertionSuccess();
+		return ::testing::AssertionFailure()
+		       << "byte " << (it - bytes.begin()) << " of " << bytes.size() << " is "
+		       << static_cast<unsigned>(*it) << ", expected all zeroes";
 	}
 
 	static void WriteBody(WritePageGuard& guard, std::string_view text) {
@@ -218,6 +240,12 @@ TEST_F(BufferPoolManagerTest, ExhaustedPoolReturnsBufferPoolFull) {
 	auto new_page = bpm_->NewPage();
 	ASSERT_FALSE(new_page.has_value());
 	ASSERT_EQ(new_page.error().code(), ErrorCode::kBufferPoolFull);
+
+	// Released BEFORE the census, not after: these guards are the test's own memory pressure,
+	// not a leak, and AssertQuiesced counts pins. Dropping them here is what makes the count
+	// below mean "the failed NewPage left a frame behind".
+	pages.clear();
+	AssertQuiesced("after NewPage failed on a full pool");
 }
 
 // Same setup, then drop one guard. The next fetch must succeed -- proving ReclaimFrame found
@@ -225,35 +253,177 @@ TEST_F(BufferPoolManagerTest, ExhaustedPoolReturnsBufferPoolFull) {
 TEST_F(BufferPoolManagerTest, ReleasingAGuardMakesAFrameReclaimable) {
 	auto pages = FillPool();
 	pages.pop_back();
+
+	// The precondition, asserted rather than assumed: nothing free, one candidate. Without it
+	// the test still passes if FillPool quietly stopped filling, and would then be proving
+	// nothing about the replacer.
+	const PoolStats before = bpm_->GetStats();
+	ASSERT_EQ(before.free_list_size, 0u) << "a free frame would let NewPage skip ReclaimFrame";
+	ASSERT_EQ(before.pinned_frames, kFrames - 1);
+	ASSERT_EQ(before.evictable, 1u);
+
 	auto new_page = bpm_->NewPage();
-	ASSERT_TRUE(new_page.has_value());
+	ASSERT_TRUE(new_page.has_value()) << new_page.error().message();
+
+	pages.clear();
+	new_page->Drop();
+	AssertQuiesced("after reclaiming the released frame");
 }
 
 // Write a page, drop the guard, then force it out by fetching enough other pages. Its bytes
 // must be on disk afterwards, read straight through DiskManager. This is the only test that
 // exercises the dirty path of ReclaimFrame, which is the one that spans I/O.
 TEST_F(BufferPoolManagerTest, DirtyVictimIsWrittenBackWhenEvicted) {
-	GTEST_SKIP() << "TODO";
+	const page_id_t page_id = SeedPage("");
+	{
+		auto write_page = bpm_->FetchPageWrite(page_id);
+		ASSERT_TRUE(write_page.has_value()) << write_page.error().message();
+		WriteBody(write_page.value(), "some data");
+	}  // guard drops: dirty, unpinned, and now the pool's only eviction candidate
+
+	EXPECT_EQ(ReadBodyFromDisk(page_id), "") << "dropping a guard must not write to disk";
+
+	// Pigeonhole, not policy. The victim holds one frame and kFrames-1 are free, so fetching
+	// kFrames other pages and keeping every guard alive leaves the last fetch with no free
+	// frame and exactly one candidate: it must evict page_id, whatever the sweep would have
+	// preferred. A loop of "enough" fetches instead bets on the replacer's current usage-count
+	// policy, and starts flaking the day that policy is tuned.
+	std::vector<ReadPageGuard> pressure;
+	for (std::size_t i = 0; i < kFrames; ++i) {
+		const page_id_t other = SeedPage("some other data");
+		ASSERT_NE(other, INVALID_PAGE);
+		auto g = bpm_->FetchPageRead(other);
+		ASSERT_TRUE(g.has_value()) << g.error().message();
+		pressure.push_back(std::move(g.value()));
+	}
+
+	EXPECT_EQ(ReadBodyFromDisk(page_id), "some data")
+	    << "the dirty victim was evicted without a write-back";
+
+	pressure.clear();
+	AssertQuiesced("after the dirty victim was evicted");
 }
 
 // The body must be all zeroes and the header must carry this page's own id with page_type
 // ALLOCATED. The header half matters: NewPage is the one path that creates page contents
 // without reading them, so a missing stamp is only discovered on a later miss.
 TEST_F(BufferPoolManagerTest, NewPageIsZeroedAndItsHeaderIsStamped) {
-	GTEST_SKIP() << "TODO";
+	{
+		auto np = bpm_->NewPage();
+		ASSERT_TRUE(np.has_value()) << np.error().message();
+
+		// EXPECT, not ASSERT: these are independent fields, and the useful output is which of
+		// them is wrong rather than just that the first one was.
+		const PageHeader header = np->Header();
+		EXPECT_EQ(header.page_id, np->PageId())
+		    << "the bytes disagree with what the pool believes this frame holds";
+		EXPECT_EQ(header.page_type, PageType::ALLOCATED);
+		EXPECT_EQ(header.format_version, PAGE_FORMAT_VERSION)
+		    << "NewPage stamps this by default-construction, not through write_page_header";
+
+		// INVALID_PAGE is -1 while the zeroed value is 0, which is META_PAGE_ID: an unstamped
+		// header does not read as empty, it reads as a link to the superblock -- and
+		// next_page_id doubles as the disk freelist link. This is the pair that separates
+		// "stamped" from "merely zeroed".
+		EXPECT_EQ(header.next_page_id, INVALID_PAGE);
+		EXPECT_EQ(header.prev_page_id, INVALID_PAGE);
+
+		EXPECT_TRUE(AllZero(np->Body()));
+	}
+
+	AssertQuiesced("after NewPage");
+}
+
+// The zero-fill only has anything to do when the frame NewPage acquires is a reclaimed one
+// still holding another page's bytes. On a fresh pool the frame comes off the free list with
+// memory that was already zero at construction, so the test above stays green even with the
+// fill deleted -- this is the one that fails.
+TEST_F(BufferPoolManagerTest, NewPageZeroesARecycledFrame) {
+	// Dirty every frame with recognisable bytes and release them all: the free list is empty
+	// and every frame is a candidate, so NewPage has no choice but to go through ReclaimFrame.
+	{
+		std::vector<WritePageGuard> guards;
+		for (std::size_t i = 0; i < kFrames; ++i) {
+			const page_id_t id = SeedPage("");
+			ASSERT_NE(id, INVALID_PAGE);
+			auto g = bpm_->FetchPageWrite(id);
+			ASSERT_TRUE(g.has_value()) << g.error().message();
+			WriteBody(g.value(), "previous tenant");
+			guards.push_back(std::move(g.value()));
+		}
+	}
+
+	const PoolStats before = bpm_->GetStats();
+	ASSERT_EQ(before.free_list_size, 0u) << "the frame NewPage takes must be a reclaimed one";
+	ASSERT_EQ(before.evictable, kFrames);
+
+	{
+		auto np = bpm_->NewPage();
+		ASSERT_TRUE(np.has_value()) << np.error().message();
+		EXPECT_TRUE(AllZero(np->Body())) << "the previous tenant's bytes survived the reclaim";
+	}
+
+	AssertQuiesced("after NewPage on a recycled frame");
 }
 
 // NewPage with every frame pinned. It acquires a frame BEFORE allocating a page id, so the
 // failure path has nothing to unwind -- but assert the page count on disk did not grow, and
 // AssertQuiesced.
 TEST_F(BufferPoolManagerTest, NewPageOnFullPoolLeaksNothing) {
-	GTEST_SKIP() << "TODO";
+	auto pages = FillPool();
+	const page_id_t pages_before = dm_->PageCount();
+
+	auto np = bpm_->NewPage();
+	ASSERT_FALSE(np.has_value()) << "a fully pinned pool cannot hand out a new page";
+	EXPECT_EQ(np.error().code(), ErrorCode::kBufferPoolFull);
+
+	// PageCount only moves on AllocatePage's extend path, which makes it a leak detector here
+	// only because nothing in this test has ever deallocated -- the disk freelist is empty, so
+	// growth is the only way a leaked allocation can show. Add a DeletePage to the setup and a
+	// leaked page would be consumed off the freelist instead, invisible to this check, and
+	// DiskManager exposes no freelist head to assert against.
+	EXPECT_EQ(dm_->PageCount(), pages_before) << "the failed NewPage allocated a page id anyway";
+
+	pages.clear();
+	AssertQuiesced("after NewPage failed on a full pool");
 }
 
 // DeletePage while a guard is alive must be refused, and refusal must change nothing: the
 // page still fetchable, the frame still resident.
 TEST_F(BufferPoolManagerTest, DeletePageOnAPinnedPageIsRejected) {
-	GTEST_SKIP() << "TODO";
+	page_id_t page_id{INVALID_PAGE};
+	{
+		auto guard = bpm_->NewPage();
+		ASSERT_TRUE(guard.has_value()) << guard.error().message();
+		page_id = guard->PageId();
+
+		// Deleting a page this same thread holds a guard on is exactly the case DeletePage
+		// refuses to wait for -- waiting on our own pin would deadlock outright.
+		const Status st = bpm_->DeletePage(page_id);
+		ASSERT_EQ(st.code(), ErrorCode::kInvalidArgument) << st.message();
+
+		// "Changed nothing", asserted rather than hoped. The fetch at the end cannot see this:
+		// the frame is still mapped, so that fetch is a cache HIT and never touches disk -- a
+		// DeletePage that vacated the frame anyway would merely turn it into a miss that
+		// re-reads and still succeeds.
+		const PoolStats s = bpm_->GetStats();
+		EXPECT_EQ(s.resident_frames, 1u) << "the refused delete vacated the frame anyway";
+		EXPECT_EQ(s.pinned_frames, 1u);
+		EXPECT_EQ(s.free_frames, kFrames - 1);
+
+		// The other half the fetch cannot see: a rejection that ran DeallocatePage anyway
+		// leaves the page on the disk freelist while it is still cached and readable -- free
+		// stock and live data at once. Only a read straight through DiskManager catches it.
+		EXPECT_EQ(ReadHeaderFromDisk(page_id).page_type, PageType::ALLOCATED)
+		    << "the refused delete reached the disk allocator";
+	}
+
+	{
+		auto pg = bpm_->FetchPageRead(page_id);
+		ASSERT_TRUE(pg.has_value()) << pg.error().message();
+	}
+
+	AssertQuiesced("after the refused delete");
 }
 
 // After deleting, free_frames goes up by one and evictable goes DOWN by one. The second half
@@ -261,7 +431,36 @@ TEST_F(BufferPoolManagerTest, DeletePageOnAPinnedPageIsRejected) {
 // candidate set by hand, and forgetting it puts the frame in the free list and the replacer
 // at once, so two threads can be handed the same frame.
 TEST_F(BufferPoolManagerTest, DeletePageReturnsTheFrameAndLeavesTheCandidateSet) {
-	GTEST_SKIP() << "TODO";
+	page_id_t page_id{INVALID_PAGE};
+	{
+		auto np = bpm_->NewPage();
+		ASSERT_TRUE(np.has_value()) << np.error().message();
+		page_id = np->PageId();
+	}  // guard drops: one frame resident, unpinned, and in the candidate set
+
+	// Absolute values rather than deltas. These counters are unsigned, so a precondition of
+	// evictable == 0 would make `before.evictable - 1` wrap to SIZE_MAX and report a bug that
+	// is not the one that fired.
+	const PoolStats before = bpm_->GetStats();
+	ASSERT_EQ(before.free_frames, kFrames - 1);
+	ASSERT_EQ(before.resident_frames, 1u);
+	ASSERT_EQ(before.evictable, 1u) << "an unpinned resident frame must be a candidate";
+
+	// The page is dirty here -- NewPage's write guard bumped the epoch on release -- so this
+	// also covers the one path in the component where a dirty frame owes no writeback.
+	const Status st = bpm_->DeletePage(page_id);
+	ASSERT_TRUE(st.ok()) << st.message();
+
+	const PoolStats after = bpm_->GetStats();
+	EXPECT_EQ(after.free_frames, kFrames);
+	EXPECT_EQ(after.resident_frames, 0u);
+	EXPECT_EQ(after.evictable, 0u) << "the freed frame is still an eviction candidate";
+
+	// The half neither counter above can see: free_frames counts state == Free, which
+	// DeletePage sets in a different place from free_list_.Push. Delete the Push and both
+	// EXPECTs above still pass while the frame is unreachable forever -- AssertQuiesced's
+	// free_frames == free_list_size is the only thing that compares the two.
+	AssertQuiesced("after deleting an unpinned page");
 }
 
 // Dirty several pages, call FlushAllPages once, verify every one of them on disk.
