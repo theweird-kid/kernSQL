@@ -321,8 +321,8 @@ Result<PageHeader> DiskManager::read_page_header(page_id_t page_id) {
 
 Status DiskManager::write_page_header(page_id_t page_id, const PageHeader& header) {
 	if (!valid_write_target(page_id)) {
-		return Status::InvalidArgument(
-		    std::format("invalid page id {} for write, page id <= {}", page_id, this->page_count_.load()));
+		return Status::InvalidArgument(std::format("invalid page id {} for write, page id <= {}",
+		                                           page_id, this->page_count_.load()));
 	}
 	// Identity is stamped HERE, not by callers. Five sites write headers (both reserved pages
 	// in Open, AllocatePage, DeallocatePage, persist_freelist_head) and every one of them owes
@@ -344,8 +344,8 @@ Status DiskManager::write_page_header(page_id_t page_id, const PageHeader& heade
 
 Status DiskManager::write_empty_page(page_id_t page_id) {
 	if (!valid_write_target(page_id)) {
-		return Status::InvalidArgument(
-		    std::format("invalid page id {} for write, page id <= {}", page_id, this->page_count_.load()));
+		return Status::InvalidArgument(std::format("invalid page id {} for write, page id <= {}",
+		                                           page_id, this->page_count_.load()));
 	}
 	std::array<std::byte, PAGE_SIZE> empty_buf{};
 	if (Status s = full_write(PageOffset(page_id), empty_buf); !s.ok()) {
@@ -379,9 +379,9 @@ Status DiskManager::full_write(off_t off, std::span<const std::byte> buf) {
 			// Status construction are both allowed to make library calls.
 			int err = errno;
 			if (err == EINTR) continue;
-			return Status::IOError(std::format("pwrite at offset {} failed after {} of {} bytes: {}",
-			                                   off, done, buf.size(),
-			                                   std::system_category().message(err)));
+			return Status::IOError(
+			    std::format("pwrite at offset {} failed after {} of {} bytes: {}", off, done,
+			                buf.size(), std::system_category().message(err)));
 		}
 		done += static_cast<std::size_t>(n);
 	}
@@ -406,9 +406,8 @@ Status DiskManager::full_read(off_t off, std::span<std::byte> buf) {
 			// would never make progress. Corruption rather than IOError — nothing
 			// went wrong at the syscall level, the file is simply not the size the
 			// page count says it is.
-			return Status::Corruption(
-			    std::format("unexpected EOF at offset {}: wanted {} bytes, got {}", off, buf.size(),
-			                done));
+			return Status::Corruption(std::format(
+			    "unexpected EOF at offset {}: wanted {} bytes, got {}", off, buf.size(), done));
 		}
 		done += static_cast<std::size_t>(n);
 	}
