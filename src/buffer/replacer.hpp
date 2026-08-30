@@ -41,12 +41,13 @@ class Replacer {
 
 	// Adds/removes frame_id from the eviction-candidate set. Idempotent.
 	void SetEvictable(frame_id_t frame_id, bool evictable) {
-		assert(static_cast<std::size_t>(frame_id) < evictable_.size());
+		const auto index = static_cast<std::size_t>(frame_id);
+		assert(index < evictable_.size());
 		std::lock_guard<std::mutex> guard(mtx_);
 
-		if (evictable_[frame_id] == evictable) return;
+		if (evictable_[index] == evictable) return;
 
-		evictable_[frame_id] = evictable;
+		evictable_[index] = evictable;
 		if (evictable)
 			++evictable_count_;
 		else

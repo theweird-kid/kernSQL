@@ -196,7 +196,10 @@ int main(int argc, char** argv) {
 		std::print("kernsql> ");
 		std::cout.flush();
 		if (!std::getline(std::cin, line)) {
-			std::println();  // EOF (ctrl-D) — treat as a clean quit
+			// std::println("") rather than std::println(): the zero-argument overload is
+			// P3142, a C++26 addition. libc++ 21 has it, libc++ 18 (what CI builds with) does
+			// not, and this is the only place we would need it.
+			std::println("");  // EOF (ctrl-D) — treat as a clean quit
 			break;
 		}
 		if (!Dispatch(bpm, **dm, line)) break;
