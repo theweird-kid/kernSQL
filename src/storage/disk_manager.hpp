@@ -1,8 +1,12 @@
 #pragma once
 
+#include <sys/types.h>
+
+#include <atomic>
 #include <cstddef>
 #include <filesystem>
 #include <memory>
+#include <mutex>
 #include <span>
 
 #include "common/page_header.hpp"
@@ -36,11 +40,22 @@ namespace kernsql {
 //    PageType::ALLOCATED at the moment it's returned — it will never be mistaken
 //    for FREE or for a real content type before the caller writes its own header.
 //
+// Thread safety, precisely:
+//  - AllocatePage/DeallocatePage are safe to call concurrently with each other and
+//    with any other method here. Each holds meta_latch_ across its entire
+//    read-modify-persist sequence, not just the freelist_head_ assignment: the
+//    freelist walk and the page-0 head persist have to be atomic against a
+//    concurrent allocation or deallocation. Two deallocations of the same page that
+//    interleave would both pass the already-FREE check and thread the page onto the
+//    list twice, producing a cycle — which surfaces much later as an allocation loop
+//    that hands out the same page forever.
+//  - ReadPage/WritePage/PageCount are deliberately latch-free, and stay that way.
+//    pread/pwrite are atomic per call with respect to the file offset, and
+//    page_count_ is atomic, so the bounds check races with nothing. Excluding two
+//    callers from the *same* page is not this layer's problem — that is exactly what
+//    the buffer pool's per-frame content latch is for (see DD-002).
+//
 // Explicitly NOT guaranteed:
-//  - Thread safety. No method here is safe to call concurrently with another call
-//    on the same DiskManager, including two calls touching different pages, since
-//    freelist_head_/page_count_ are mutated without synchronization. Concurrency
-//    control (per-page latching) belongs one layer up, in the buffer pool.
 //  - Leak freedom. If a caller lets a page_id from AllocatePage go out of scope
 //    without ever calling DeallocatePage, that page is gone for good — same
 //    contract as malloc/free. DiskManager has no way to detect or reclaim it.
@@ -94,6 +109,15 @@ class DiskManager {
 	// catalog root can never be freed or reused, even though it's readable/writable
 	// through ReadPage/WritePage). Does not clear the page's body — only its header
 	// is overwritten to mark it FREE.
+	//
+	// CONTRACT: `page_id` must not be resident in the buffer pool when this is
+	// called. This method stamps the page's on-disk header FREE directly, so any
+	// cached copy of that page still held in a frame is stale the instant this
+	// returns — and a later flush of that frame would write the old header back over
+	// the FREE stamp, resurrecting a page that is on the freelist and simultaneously
+	// reachable as live data. Callers above this layer therefore never call this
+	// directly; they go through BufferPoolManager::DeletePage, which vacates the
+	// frame first and then calls here (see DD-002, "NewPage / DeletePage").
 	Status DeallocatePage(page_id_t page_id);
 
 	// fsyncs the underlying file descriptor. This is the only durability
@@ -131,12 +155,56 @@ class DiskManager {
 
 	Status write_empty_page(page_id_t page_id);
 
+	// Requires meta_latch_ held.
 	Status persist_freelist_head(page_id_t new_head);
+
+	// Byte offset of `page_id` in the file. Exists so the conversion is written
+	// exactly once: every raw I/O in this class is a (PageOffset(id), span) pair, and
+	// an offset computed ad hoc at each call site is a place to get the arithmetic
+	// subtly wrong. The cast precedes the multiply on principle — the product is
+	// already 64-bit here because PAGE_SIZE is std::size_t, but that is a property of
+	// a constant in another header, not something this expression should depend on.
+	// Callers are responsible for rejecting negative page_ids first (valid_page /
+	// valid_write_target both do); a negative id here yields a negative offset.
+	[[nodiscard]]
+	static constexpr off_t PageOffset(page_id_t page_id) {
+		return static_cast<off_t>(page_id) * static_cast<off_t>(PAGE_SIZE);
+	}
+
+	// Every raw pread/pwrite in this class routes through these two. A short transfer
+	// is legal for both syscalls and is not an error, and EINTR is a retry rather than
+	// a failure — handling that at five separate call sites is five chances to get it
+	// wrong. They also carry real errno text out, so an ENOSPC or EBADF is visible in
+	// the Status instead of a generic "failed to write page".
+	Status full_write(off_t off, std::span<const std::byte> buf);
+
+	// As full_write, with one asymmetry: a zero-byte return from pread is EOF, not a
+	// retry condition. It means the file is shorter than the caller's bounds check
+	// believed, which is corruption; treating it as a short read and looping would
+	// spin forever on a truncated file.
+	Status full_read(off_t off, std::span<std::byte> buf);
 
 	int fd_;
 	std::filesystem::path path_;
+
+	// Serializes the read-modify-persist sequences in AllocatePage/DeallocatePage.
+	// See the thread-safety note in the class comment for why the scope is the whole
+	// operation and not just the freelist_head_ store.
+	std::mutex meta_latch_;
+
+	// Guarded by meta_latch_.
 	page_id_t freelist_head_{INVALID_PAGE};
-	page_id_t page_count_{0};
+
+	// Written only under meta_latch_, so the read-modify-write when AllocatePage
+	// extends the file is serialized. Atomic rather than a plain int because it is
+	// *read* without the latch, by valid_page/valid_write_target on the latch-free
+	// ReadPage/WritePage path. Default (seq_cst) ordering is deliberate: the store
+	// that publishes a new page must not be visible before the header write that
+	// stamped it, or a concurrent reader passes the bounds check and reads a page
+	// whose header has not been written yet. The load is a plain mov on x86 and the
+	// store happens once per file extension, next to a syscall — the ordering is
+	// free at this frequency.
+	std::atomic<page_id_t> page_count_{0};
 };
 
 }  // namespace kernsql
