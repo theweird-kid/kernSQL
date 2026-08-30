@@ -31,12 +31,16 @@ class BufferPoolManager;
 //
 //   1. WritePageGuard only: bump dirty_epoch.
 //   2. Release the content latch.
-//   3. Metadata mutex; decrement pin_count; note a 1->0 transition.
+//   3. Metadata mutex; decrement pin_count; note a 1->0 transition; if it transitioned,
+//      SetEvictable(frame_id, true) UNDER THAT SAME MUTEX.
 //   4. Release the metadata mutex.
-//   5. If it transitioned, SetEvictable(frame_id, true).
 //
-// Steps 3-5 live in BufferPoolManager::UnpinPage, which is private and which these two classes
-// are friends of. Step 1 precedes step 2 so a flusher holding the shared latch always observes
+// Steps 3-4 live in BufferPoolManager::UnpinPage, which is private and which these two classes
+// are friends of. The SetEvictable call sitting inside step 3 rather than after step 4 is the
+// one named exception to DD-002's "never call into the replacer while holding a frame's
+// metadata mutex": publishing it afterwards let DeletePage vacate the frame in the gap and
+// revoke a membership that had not been created yet, leaving one frame on the free list and in
+// the replacer's candidate set at once. Step 1 precedes step 2 so a flusher holding the shared latch always observes
 // an epoch that already accounts for every write it is about to capture; step 1 precedes step 3
 // so a reclaimer that sees pin_count == 0 under the metadata mutex is guaranteed to see this
 // guard's dirty bump too, which is what makes its clean-check exact rather than merely

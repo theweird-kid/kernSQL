@@ -13,7 +13,6 @@
 #include <format>
 #include <latch>
 #include <memory>
-#include <mutex>
 #include <random>
 #include <set>
 #include <span>
