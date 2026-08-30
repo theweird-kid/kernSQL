@@ -4,8 +4,8 @@
 
 #include <algorithm>
 #include <array>
-#include <barrier>
 #include <atomic>
+#include <barrier>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -728,7 +728,8 @@ TEST_F(BufferPoolManagerTest, ConcurrentFetchesOfOnePageShareOneFrame) {
 		SCOPED_TRACE(std::format("thread {}", i));
 		if (!outcomes[i].status.ok()) {
 			EXPECT_EQ(outcomes[i].status.code(), ErrorCode::kBufferPoolFull)
-			    << "the only legal refusal here is a full pool, got: " << outcomes[i].status.message();
+			    << "the only legal refusal here is a full pool, got: "
+			    << outcomes[i].status.message();
 			continue;
 		}
 		granted++;

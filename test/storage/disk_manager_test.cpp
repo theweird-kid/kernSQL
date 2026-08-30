@@ -583,8 +583,7 @@ TEST_F(DiskManagerTest, ReadPageOnTruncatedFileReportsCorruption) {
 
 	// Truncate the page away behind the open handle. page_count_ is in-memory state,
 	// so the bounds check still passes and the read runs straight off the end.
-	std::filesystem::resize_file(path_,
-	                             static_cast<std::uintmax_t>(id.value()) * PAGE_SIZE);
+	std::filesystem::resize_file(path_, static_cast<std::uintmax_t>(id.value()) * PAGE_SIZE);
 
 	std::array<std::byte, PAGE_SIZE> buf{};
 	Status st = disk.ReadPage(id.value(), buf);
