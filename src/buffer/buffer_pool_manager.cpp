@@ -169,20 +169,36 @@ PoolStats BufferPoolManager::GetStats() const {
 void BufferPoolManager::UnpinPage(frame_id_t frame_id) {
 	auto& frame = FrameAt(frame_id);
 
-	bool evictable{false};
-	{
-		std::lock_guard lock(frame.mtx_);
+	std::lock_guard lock(frame.mtx_);
 
-		if (frame.state_ == FrameState::Failed) frame.cv_.notify_all();
-		assert(frame.pin_count_ > 0);
+	if (frame.state_ == FrameState::Failed) frame.cv_.notify_all();
+	assert(frame.pin_count_ > 0);
 
-		evictable = ((frame.pin_count_ == 1) && (frame.state_ == FrameState::Resident));
-		frame.pin_count_ -= 1;
-		if (frame.pin_count_ < 0) {
-			LOG_INFO("frame %d pin count is dropped to %d", frame_id, frame.pin_count_);
-		}
+	const bool evictable = ((frame.pin_count_ == 1) && (frame.state_ == FrameState::Resident));
+	frame.pin_count_ -= 1;
+	if (frame.pin_count_ < 0) {
+		LOG_INFO("frame %d pin count is dropped to %d", frame_id, frame.pin_count_);
 	}
 
+	// Under the metadata mutex, and it is the ONE exception to DD-002's "never call into the
+	// replacer while holding a frame's metadata mutex" (see "Lock ordering", which now names it).
+	//
+	// Publishing this outside the mutex splits the decision from the act, and DeletePage fits in
+	// the gap: it takes the mutex, sees the pin_count == 0 we just produced, vacates the frame,
+	// calls SetEvictable(false) -- which removes nothing, because our `true` has not landed yet --
+	// and pushes the frame to the free list. Our `true` then arrives at a frame that is now free
+	// stock, leaving it on the free list and in the candidate set at once. That is exactly the
+	// double membership DeletePage's own comment says must never exist, and only ReclaimFrame's
+	// re-validation of `state == Resident` keeps it from becoming two threads on one frame.
+	//
+	// The 0->1 direction in FetchFrame needs no such treatment and keeps the deferred form. It is
+	// not symmetric: the only thing that ADDS a frame to the candidate set is an unpin, and in
+	// that window the caller holds the pin, so no unpin can happen and no straggler can undo the
+	// SetEvictable(false).
+	//
+	// Safe as an exception because Replacer is a strict leaf -- every method takes only its own
+	// mutex and never reaches back into a frame, a shard, or the free list. The edge this adds is
+	// metadata -> replacer, and nothing anywhere goes the other way.
 	if (evictable) replacer_.SetEvictable(frame_id, true);
 }
 
@@ -587,11 +603,28 @@ Status BufferPoolManager::DeletePage(page_id_t page_id) {
 		    std::format("page {} is reserved and cannot be deleted", page_id));
 	}
 
+	// Held for the WHOLE operation, deallocation included, rather than released after the erase.
+	// That is the fix for the stale-mapping race (DD-002, "Known behaviour"): between erasing the
+	// mapping and stamping the header FREE, a fetcher that missed could publish a fresh Loading
+	// mapping for this page, read a header still marked ALLOCATED, pass the miss-path validation
+	// at FetchFrame's read check, and leave the pool caching a page that is on the disk freelist.
+	// The next AllocatePage then hands that id out again and the new owner's fetch is a cache hit
+	// on the dead page's bytes. Holding the shard is the whole guarantee: no new mapping for this
+	// page can be published until the header says FREE, and then the validation rejects it.
+	//
+	// This is the second named exception in DD-002's "Lock ordering": it blocks on I/O while
+	// holding a shard lock. Affordable because the I/O is bounded and this path is not hot —
+	// DeallocatePage is three syscalls with no fsync, and it already serializes every deleter and
+	// allocator in the process on DiskManager's global meta_latch_, so the shard lock adds only
+	// the other pages in this one shard, for a span the call already spends. New ordering edge,
+	// shard -> DiskManager::meta_latch_, closes no cycle: DiskManager knows nothing about the
+	// page table and can never reach back for a shard.
+	auto shard = page_table_.AcquireShard(page_id);
+
 	// -1 means "not cached" — the page may legitimately have no frame, in which case there is
 	// nothing to vacate and only the disk side needs doing.
 	frame_id_t frame_id{-1};
 	{
-		auto shard = page_table_.AcquireShard(page_id);
 		auto found = shard.Find(page_id);
 
 		if (found.has_value()) {
@@ -622,7 +655,7 @@ Status BufferPoolManager::DeletePage(page_id_t page_id) {
 			frame.ResetEpochs();
 			shard.Erase(page_id);
 		}
-	}  // both released
+	}  // frame metadata mutex released; the shard lock is still held, deliberately
 
 	if (frame_id != -1) {
 		// Mandatory, and the only place in the component that needs it. A Resident frame with
@@ -639,6 +672,8 @@ Status BufferPoolManager::DeletePage(page_id_t page_id) {
 	// still-resident frame would write the old header back over that stamp — leaving a page
 	// that is on the disk freelist and reachable as live data at the same time. Once the frame
 	// is Free, FlushAllPages skips it, so no flush can ever reach this page again.
+	//
+	// Still under the shard lock. See the acquisition above for why that matters.
 	Status st = disk_manager_.DeallocatePage(page_id);
 
 	// Returned regardless of the deallocation result. The frame is already Free, unmapped and

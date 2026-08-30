@@ -150,12 +150,37 @@ needs two shard locks.
 
 Standing rules:
 
-- **Never block on I/O or a condvar while holding a shard lock.** Both waits here — a miss waiter on
-  `Loading`, the loader on the failed-load path — drop it first.
-- **Never call into the replacer or free list while holding a frame's metadata mutex.** Note the
-  0→1 or 1→0 transition under the mutex, release it, *then* call `RecordAccess`/`SetEvictable`.
-  This admits a benign race (a frame briefly evictable while about to be re-pinned), harmless
-  because reclaim re-validates `pin_count == 0` before repurposing.
+- **Never block on I/O or a condvar while holding a shard lock, with one named exception.** Both
+  waits here — a miss waiter on `Loading`, the loader on the failed-load path — drop it first.
+
+  **The exception: `DeletePage` holds the shard lock across `DiskManager::DeallocatePage`.** That is
+  the whole guarantee against the stale-mapping race in "Known behaviour" — no new mapping for the
+  page can be published until its header reads `FREE`, at which point the miss-path validation
+  rejects the fetch. Affordable because the I/O is bounded and the path is not hot:
+  `DeallocatePage` is three syscalls with no `fsync`, and it already serializes every deleter and
+  allocator in the process on `DiskManager`'s global `meta_latch_`, so the shard lock adds only the
+  other pages in that one shard for a span the call already spends. New ordering edge,
+  shard → `meta_latch_`, closing no cycle: `DiskManager` knows nothing about the page table. The
+  alternatives — a tombstone entry in the shard, or keeping the frame mapped as `Loading` across
+  the deallocation — both put a new case into the hot fetch path, and are the answer only if
+  `DeletePage` ever shows up in a profile.
+- **Never call into the replacer or free list while holding a frame's metadata mutex, with one
+  named exception.** Note the 0→1 transition under the mutex, release it, *then* call
+  `RecordAccess`/`SetEvictable(false)`. This admits a benign race (a frame briefly evictable while
+  about to be re-pinned), harmless because reclaim re-validates `pin_count == 0` before repurposing.
+
+  **The exception: `UnpinPage`'s `SetEvictable(true)` is made under the metadata mutex.** The two
+  directions are not symmetric. Deferring the 1→0 publication splits the decision from the act, and
+  `DeletePage` fits in the gap — it sees the `pin_count == 0` the unpinner just produced, vacates
+  the frame, calls `SetEvictable(false)` (which removes nothing, the membership having never been
+  published) and pushes to the free list; the straggling `true` then lands on free stock, leaving
+  one frame on the free list *and* in the candidate set. See "Known behaviour". The 0→1 direction
+  has no such hazard: the only thing that adds a frame to the candidate set is an unpin, and in
+  that window the caller holds the pin, so no unpin can occur. The exception is safe because
+  `Replacer` is a strict leaf — every method takes only its own mutex and never reaches back into a
+  frame, a shard, or the free list — so the added `metadata → replacer` edge closes no cycle. The
+  cost is that an unpinner can now hold a frame's metadata mutex while waiting behind `Evict()`'s
+  sweep, which sharpens the sweep-under-one-lock issue noted below.
 - Any operation needing two content latches takes them in a globally fixed order, not a
   caller-dependent one. State the order where that operation is designed.
 
@@ -180,9 +205,9 @@ that field is under the metadata mutex.
 
 1. `WritePageGuard` only: bump `dirty_epoch`.
 2. Release the content latch.
-3. Metadata mutex; decrement `pin_count`; note a 1→0 transition.
+3. Metadata mutex; decrement `pin_count`; note a 1→0 transition; if it transitioned,
+   `SetEvictable(frame_id, true)` **under that same mutex** (the named exception in "Lock ordering").
 4. Release the metadata mutex.
-5. If it transitioned, `SetEvictable(frame_id, true)`.
 
 Step 1 precedes 2 so a flusher sees an epoch covering every write it is about to capture, and
 precedes 3 so a reclaimer's clean-check is exact. The frame cannot be reclaimed between 2 and 3 —
@@ -250,11 +275,14 @@ the condvar forever.
   `pin_count = 1`, release, zero the buffer under the content latch, return a `WritePageGuard`.
 - **DeletePage** — shard lock, then metadata mutex. Reject if `pin_count != 0`. Dirty contents are
   discarded without a flush. Set `INVALID_PAGE`, `Free`, reset epochs, erase the mapping, release
-  both. Then `SetEvictable(false)`, `DiskManager::DeallocatePage`, push to the free list. Vacating
-  before deallocating satisfies `DeallocatePage`'s not-resident contract.
-- **UnpinPage** — private, guard-only. Under the metadata mutex: notify all if `Failed`, then note
-  whether this is a **1→0 transition on a `Resident` frame**, then decrement. Release the mutex,
-  and only then `SetEvictable(true)` if it transitioned.
+  the metadata mutex. Then, **still holding the shard lock**, `SetEvictable(false)`,
+  `DiskManager::DeallocatePage`, push to the free list. Vacating before deallocating satisfies
+  `DeallocatePage`'s not-resident contract; keeping the shard lock across the deallocation is the
+  named exception in "Lock ordering", and without it a racing miss can republish the page.
+- **UnpinPage** — private, guard-only. Under the metadata mutex: notify all if `Failed`, note
+  whether this is a **1→0 transition on a `Resident` frame**, decrement, and — still under that
+  mutex — `SetEvictable(true)` if it transitioned. Holding the mutex across that call is the one
+  exception in "Lock ordering"; releasing first is what produced the lost-`SetEvictable` bug below.
 
   Both halves of that condition are load-bearing. Testing the post-decrement value instead of the
   transition would mark a frame evictable on a spurious unpin at `pin_count == 0`; testing the pin
@@ -305,6 +333,28 @@ durability mechanism. It is load-bearing today only because there is no log yet.
 
 ## Known behaviour
 
+- **A fetch racing a delete of the same page left the pool caching a deallocated page. FIXED
+  2026-08-30.** `DeletePage` erased the mapping, dropped both locks, and only then called
+  `DiskManager::DeallocatePage`. A fetcher that misses inside that window reads a header still
+  stamped `ALLOCATED`, passes the miss-path validation, and republishes a `Resident` mapping for a
+  page that is about to join the disk free list. Consequences, in increasing severity: a later
+  fetch of that page id is a cache hit returning stale bytes with no error; `AllocatePage` hands
+  the id out again and the new owner's fetch hits the stale frame, so a freshly allocated page
+  arrives holding a dead page's contents; a flush of that frame then writes those bytes over the
+  new owner's. Measured by `ConcurrentDeleteAndFetchStayConsistent` at ~1–5% of successful fetches
+  and ~6% of rounds (`stale_after_delete`). Fixed by holding the shard lock across
+  `DeallocatePage` — the named exception in "Lock ordering" — so no new mapping can be published
+  before the header reads `FREE`. Both counters have been zero over 10,000 rounds since. The pool
+  no longer leans on the caller to exclude this, though callers generally do anyway: InnoDB frees
+  pages under the index X-latch, and Postgres does not recycle page ids outside `VACUUM`'s
+  `AccessExclusiveLock`.
+- **Lost `SetEvictable(true)`, leaving a frame on the free list and in the candidate set at once.
+  FIXED 2026-08-30.** `UnpinPage` published evictability after releasing the metadata mutex;
+  `DeletePage` could vacate the frame in that gap and revoke a membership that had not yet been
+  created. Symptom: `evictable > resident_frames` at quiescence, reproduced by
+  `ConcurrentDeleteAndFetchStayConsistent` in roughly 8 runs in 20. Not corruption in practice —
+  `ReclaimFrame` re-validates `state == Resident` and declines the victim — but the census lied and
+  the free-list/candidate-set exclusion was broken. Fixed by the "Lock ordering" exception above.
 - `DeletePage` can spuriously fail while a reclaimer holds a transient pin across a dirty victim's
   writeback. It rejects rather than waiting, so deleting a page you still hold a guard on is an
   error rather than a deadlock.

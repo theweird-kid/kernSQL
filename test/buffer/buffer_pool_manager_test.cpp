@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <array>
+#include <barrier>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -680,7 +681,15 @@ TEST_F(BufferPoolManagerTest, FailedLoadWakesEveryWaiter) {
 // than outcomes and so flags a race even in a run whose timing happened to work out.
 // Assert AssertQuiesced() after joining, not just "did not crash".
 
-// N threads fetching one page. All must see identical bytes, and only one frame may be used.
+// N threads fetching one page. Everyone who gets the page must see identical bytes, and the page
+// may occupy only one frame.
+//
+// Not "all 32 must succeed". A miss calls AcquireFrame() BEFORE re-checking the shard, so in the
+// opening stampede up to kFrames threads can each be holding a frame while they race to publish
+// the mapping; the next one along finds the free list empty and every frame taken, and is refused
+// with kBufferPoolFull. That is documented behaviour (buffer_pool_manager.hpp, "Errors"), not a
+// failure, and it fires roughly 2 runs in 15 under asan. What must never happen is a thread
+// getting the page and reading the wrong bytes, or the page landing in two frames.
 TEST_F(BufferPoolManagerTest, ConcurrentFetchesOfOnePageShareOneFrame) {
 	std::string data{"all must see this"};
 	page_id_t page_id = SeedPage(data);
@@ -689,23 +698,47 @@ TEST_F(BufferPoolManagerTest, ConcurrentFetchesOfOnePageShareOneFrame) {
 	std::vector<std::thread> threads;
 	threads.reserve(kThreads);
 
+	// Status and bytes kept separately. Folding a failure into the body string ("something else")
+	// loses which status it was, and kBufferPoolFull is the only legal one here -- there is no
+	// deleter, the page exists, and its header is valid, so kInvalidArgument, kIOError or
+	// kCorruption would each be a real bug wearing the same disguise.
+	struct Outcome {
+		Status status = Status::OK();
+		std::string body{};
+	};
+
 	std::latch gate(static_cast<std::ptrdiff_t>(kThreads));
-	std::vector<std::string> read_value(kThreads);
+	std::vector<Outcome> outcomes(kThreads);
 
 	for (size_t i = 0; i < kThreads; i++) {
 		threads.emplace_back([&, i] {
 			gate.arrive_and_wait();
 			auto read_page = bpm_->FetchPageRead(page_id);
-			read_value[i] = read_page.has_value()
-			                    ? AsChars(read_page.value().Body().subspan(0, data.size()))
-			                    : "something else";
+			if (read_page.has_value())
+				outcomes[i].body = AsChars(read_page.value().Body().subspan(0, data.size()));
+			else
+				outcomes[i].status = read_page.error();
 		});
 	}
 
 	for (auto& t : threads) t.join();
+
+	size_t granted = 0;
 	for (size_t i = 0; i < kThreads; i++) {
-		EXPECT_EQ(data, read_value[i]);
+		SCOPED_TRACE(std::format("thread {}", i));
+		if (!outcomes[i].status.ok()) {
+			EXPECT_EQ(outcomes[i].status.code(), ErrorCode::kBufferPoolFull)
+			    << "the only legal refusal here is a full pool, got: " << outcomes[i].status.message();
+			continue;
+		}
+		granted++;
+		EXPECT_EQ(data, outcomes[i].body);
 	}
+
+	// The thread that published the mapping owns the frame and cannot be refused, so a run in
+	// which nobody got the page means something other than pool pressure went wrong.
+	EXPECT_GT(granted, 0u) << "every fetch was refused; this run proved nothing";
+	RecordProperty("fetches_granted", static_cast<int>(granted));
 
 	ASSERT_EQ(bpm_->GetStats().resident_frames, 1);  // every thread pins the page to a single frame
 	AssertQuiesced("after releasing all guards");
@@ -909,11 +942,201 @@ TEST_F(BufferPoolManagerTest, ConcurrentNewPageReturnsDistinctPages) {
 	AssertQuiesced("after concurrent NewPage");
 }
 
-// One thread deleting while others fetch the same page. Each operation must either succeed
-// or fail cleanly; nothing may return another page's bytes. Expect spurious DeletePage
-// rejections -- that is documented behaviour, not a failure.
+// One thread deleting while others fetch the same page.
+//
+// Every operation must either succeed or fail with a status from the legal set below, the pool's
+// frame accounting must survive the race, and -- the headline -- a fetch that succeeds must return
+// THIS round's bytes. Not an earlier round's, not another page's.
+//
+// That last assertion only became true with the stale-mapping fix (DD-002, "Known behaviour").
+// Before it, DeletePage erased the page-table mapping, dropped both locks, and only then called
+// DeallocatePage. A fetcher that missed inside that window read a header still stamped ALLOCATED,
+// passed the miss-path validation, and republished a Resident mapping for a page about to land on
+// the disk freelist; the next round's SeedPage recycled that id, and the fetch was a cache hit on
+// the stale frame -- round N reading round N-1's bytes, at 1-5% of successful fetches and ~6% of
+// rounds. DeletePage now holds the shard lock across the deallocation, so no new mapping for the
+// page can be published until its header says FREE, at which point the miss-path check rejects it.
+// fetch_stale and stale_after_delete are the regression detectors: both must be zero, and both
+// were reliably non-zero before the fix.
+//
+// Expect spurious DeletePage rejections -- that is documented behaviour, not a failure.
 TEST_F(BufferPoolManagerTest, ConcurrentDeleteAndFetchStayConsistent) {
-	GTEST_SKIP() << "TODO";
+	struct FetcherOutcome {
+		Status status = Status::OK();
+		std::string res{};
+	};
+
+	struct DeleterOutcome {
+		Status status = Status::OK();
+		size_t rejections{0};
+	};
+
+	// Rounds are cheap now that the threads outlive them (see the barrier below), so the count
+	// is set by how many chances a fetcher gets to land inside DeletePage's window -- between
+	// the shard lock dropping and DeallocatePage stamping the header FREE -- not by what a
+	// spawn-per-round loop could afford. Turn it down if a sanitizer build gets tedious; that
+	// is the only reason to.
+	constexpr size_t kRounds{500};
+	constexpr size_t kDeleterMaxRetries{50};
+	constexpr size_t kDeleters{1}, kFetchers{8};
+	constexpr size_t kThreads{kDeleters + kFetchers};
+
+	struct Result {
+		DeleterOutcome del_res;
+		std::array<FetcherOutcome, kFetchers> fetch_res;
+	};
+
+	std::vector<Result> results(kRounds);
+
+	// The round's page, written ONLY by the barrier's completion function and read by every
+	// thread after the barrier releases them. No atomic and no lock: the completion runs on one
+	// thread with all others blocked, and the phase transition is the happens-before edge.
+	page_id_t page_id = INVALID_PAGE;
+	size_t next_round = 0;
+
+	// How often the hazard in the header comment actually fired: the delete landed, yet the page
+	// was still fetchable afterwards. Counted, not asserted.
+	size_t stale_after_delete = 0;
+
+	// Whether the round's delete landed, published for the completion function below. The
+	// completion runs on whichever thread arrives LAST, so reading the deleter's results slot
+	// from there is a cross-thread read. The barrier's arrive-to-completion edge makes that well
+	// defined, but TSan cannot see through libc++'s backoff spin and reports it as a race ("As if
+	// synchronized via sleep"). An explicit release/acquire flag costs nothing and keeps the
+	// sanitizer output honest.
+	std::atomic<bool> delete_landed{false};
+
+	// Runs once per phase, at the one moment in the test that is provably quiescent: every
+	// thread has finished the previous round and none has been released into the next. That
+	// makes it the right home for the per-round postconditions as well as the seeding.
+	//
+	// Must be noexcept -- std::barrier requires it, and an escaping exception is a terminate.
+	auto begin_round = [&]() noexcept {
+		// The previous round's checks, before page_id is overwritten. Skipped once anything has
+		// failed: a frame lost in round 7 would otherwise fail identically in all 493 rounds after
+		// it, and the flood buries the one report that named the cause.
+		if (next_round > 0 && !::testing::Test::HasFailure()) {
+			// Every guard is destroyed before its thread arrives here, so a non-zero pin count at
+			// this point is a leak and not a straggler.
+			AssertQuiesced(std::format("after round {}", next_round - 1));
+
+			if (delete_landed.load(std::memory_order_acquire)) {
+				// The stale-mapping probe. A deleted page SHOULD be unfetchable -- that is what
+				// FetchAfterDeleteIsRejected asserts single-threaded, and a leaked mapping is the
+				// bug class that let AbandonLoad's shard.Erase go missing without a single test
+				// noticing. Under this race it can legitimately succeed, so it is a counter rather
+				// than an expectation.
+				auto probe = bpm_->FetchPageRead(page_id);
+				stale_after_delete += probe.has_value();
+			}
+		}
+
+		page_id = SeedPage(std::format("round {} page", next_round));
+		++next_round;
+	};
+
+	// Reusable where std::latch is single-use, which is the whole reason the threads had to be
+	// respawned every round before. One barrier, kRounds phases: thread creation leaves the hot
+	// loop and stops dominating the window this test is trying to hit.
+	std::barrier sync(static_cast<std::ptrdiff_t>(kThreads), begin_round);
+
+	std::vector<std::thread> threads;
+	threads.reserve(kThreads);
+
+	// Threads 0..kDeleters-1 delete, the rest fetch.
+	for (size_t i = 0; i < kThreads; i++) {
+		threads.emplace_back([&, i] {
+			for (size_t round = 0; round < kRounds; round++) {
+				// Releases only once begin_round() has seeded this round's page, so it is both
+				// the start gun and the previous round's join.
+				sync.arrive_and_wait();
+
+				if (i < kDeleters) {
+					auto& out = results[round].del_res;
+					for (size_t attempt = 0; attempt < kDeleterMaxRetries; attempt++) {
+						out.status = bpm_->DeletePage(page_id);
+						if (out.status.ok()) break;
+						out.rejections++;
+						// A rejection means someone holds a transient pin. Re-taking the shard
+						// lock immediately just fights them for it; yield so the pin can drop.
+						std::this_thread::yield();
+					}
+					delete_landed.store(out.status.ok(), std::memory_order_release);
+				} else {
+					auto& out = results[round].fetch_res[i - kDeleters];
+					auto read_page = bpm_->FetchPageRead(page_id);
+					if (read_page.has_value())
+						out.res = ReadBody(read_page->Body());  // NUL-terminated: the seeded
+						                                        // prefix, not 4064 raw bytes
+					else
+						out.status = read_page.error();
+				}
+			}
+		});
+	}
+
+	for (auto& t : threads) t.join();
+
+	size_t fetch_ok = 0, fetch_stale = 0, fetch_failed = 0, delete_ok = 0, rejections = 0;
+
+	for (size_t round = 0; round < kRounds; round++) {
+		const std::string expected = std::format("round {} page", round);
+		SCOPED_TRACE(std::format("round {}", round));
+
+		// kInvalidArgument means two different things depending on who returned it -- "pinned"
+		// from a delete, "not allocated" from a fetch -- which is why the two roles are audited
+		// separately and never compared.
+		const Status& del = results[round].del_res.status;
+		EXPECT_TRUE(del.ok() || del.code() == ErrorCode::kInvalidArgument)
+		    << "the only legal delete failure is the pinned rejection, got: " << del.message();
+		delete_ok += del.ok();
+		rejections += results[round].del_res.rejections;
+
+		for (const FetcherOutcome& f : results[round].fetch_res) {
+			if (!f.status.ok()) {
+				fetch_failed++;
+				// kInvalidArgument: the loader read a header already stamped FREE.
+				// kIOError:         a waiter on a frame whose loader then abandoned it.
+				// kBufferPoolFull:  frame contention.
+				// Anything else -- kCorruption above all, which means the header's page_id
+				// disagreed with the id that was asked for -- is a real bug.
+				EXPECT_TRUE(f.status.code() == ErrorCode::kInvalidArgument ||
+				            f.status.code() == ErrorCode::kIOError ||
+				            f.status.code() == ErrorCode::kBufferPoolFull)
+				    << "fetch failed with a status outside the legal set: " << f.status.message();
+				continue;
+			}
+
+			fetch_ok++;
+
+			// The headline. Anything but this round's string means the pool served bytes for a
+			// page id that no longer means what the fetcher asked for -- a stale mapping for a
+			// deallocated page, or a crossed frame.
+			EXPECT_EQ(f.res, expected) << "a successful fetch returned the wrong page's bytes";
+			fetch_stale += (f.res != expected);
+		}
+	}
+
+	// Vacuity guards. A run in which every fetch was refused, or in which no delete ever landed,
+	// is green and worthless: the window this test exists to open was never open.
+	EXPECT_GT(fetch_ok, 0u) << "every fetch was refused; this run proved nothing";
+	EXPECT_GT(delete_ok, 0u) << "no delete ever landed; the post-delete window never opened";
+
+	// Both were reliably non-zero before the stale-mapping fix; see the header comment. They are
+	// redundant with the per-fetch EXPECT_EQ above and the probe, and kept because a count is what
+	// tells you a regression is rare-and-real rather than a one-off.
+	EXPECT_EQ(fetch_stale, 0u) << "a fetch was served an earlier round's bytes";
+	EXPECT_EQ(stale_after_delete, 0u)
+	    << "a page was still fetchable through the pool after its delete landed";
+
+	RecordProperty("fetch_ok", static_cast<int>(fetch_ok));
+	RecordProperty("fetch_stale", static_cast<int>(fetch_stale));
+	RecordProperty("fetch_failed", static_cast<int>(fetch_failed));
+	RecordProperty("delete_ok", static_cast<int>(delete_ok));
+	RecordProperty("delete_rejections", static_cast<int>(rejections));
+	RecordProperty("stale_after_delete", static_cast<int>(stale_after_delete));
+
+	AssertQuiesced("after concurrent delete and fetch");
 }
 
 }  // namespace kernsql
