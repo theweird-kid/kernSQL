@@ -13,12 +13,12 @@
             "state": {
               "type": "markdown",
               "state": {
-                "file": "design-docs/DD-002-buffer-pool-manager.md",
+                "file": "design-docs/DD-004-heap-pages-and-table-heap.md",
                 "mode": "preview",
                 "source": false
               },
               "icon": "lucide-file",
-              "title": "DD-002-buffer-pool-manager"
+              "title": "DD-004-heap-pages-and-table-heap"
             }
           }
         ]
@@ -188,6 +188,9 @@
   },
   "active": "213624f19b44c94b",
   "lastOpenFiles": [
+    "src/heap/heap_page.cpp",
+    "src/heap/heap_page.hpp",
+    "design-docs/DD-002-buffer-pool-manager.md",
     "build/debug/CMakeFiles/kernsql.dir/link.d",
     "build/debug/stt8jRT2",
     "build/debug/stTk6Uc9",
@@ -197,10 +200,7 @@
     "build/debug/stB1ka1L",
     "build/debug/stMIkJFI",
     "build/debug/stCuaJp3",
-    "build/debug/stI9cO3C",
-    "build/debug/CMakeFiles/kernsql_lib.dir/src/buffer/page_guard.cpp.o.d",
     "design-docs/DD-003-threading-model.md",
-    "design-docs/DD-002-buffer-pool-manager.md",
     "design-docs/DD-002-buffer-manager.md",
     "design-docs/notes/Buffer-Pool-Manager.md",
     "design-docs.md",
