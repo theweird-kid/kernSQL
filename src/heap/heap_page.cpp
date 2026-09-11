@@ -1,6 +1,5 @@
 #include "heap/heap_page.hpp"
 
-#include <algorithm>
 #include <cassert>
 #include <cstring>
 #include <expected>
@@ -196,9 +195,24 @@ Result<slot_id_t> HeapPage::Insert(std::span<const std::byte> tuple) {
 	return slot_id;
 }
 
-Status HeapPage::Delete(slot_id_t /*slot*/) {
-	// TODO(heap)
-	return Status::Internal("HeapPage::Delete not implemented");
+Status HeapPage::Delete(slot_id_t slot_id) {
+	auto slot_found = Get(slot_id);
+	if (!slot_found.has_value()) return slot_found.error();
+
+	Slot delete_slot = SlotAt(slot_id);
+
+	// update header
+	auto header = Header();
+	header.dead_bytes += delete_slot.length;
+	header.live_count--;
+	WriteHeader(header);
+
+	// update slot
+	delete_slot.length = 0;
+	delete_slot.offset = 0;
+	WriteSlot(slot_id, delete_slot);
+
+	return Status::OK();
 }
 
 Result<UpdateOutcome> HeapPage::Update(slot_id_t /*slot*/, std::span<const std::byte> /*tuple*/) {
