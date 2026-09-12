@@ -438,22 +438,41 @@ TEST_F(HeapPageTest, UpdateToAnEqualLengthTupleAddsNoGarbage) {
 // Its neighbours must be untouched — an in-place overwrite that runs long corrupts the tuple
 // physically adjacent to it, and only a neighbour check catches that.
 TEST_F(HeapPageTest, UpdateInPlaceLeavesNeighbouringTuplesIntact) {
-	HeapPage page = Page();
+	constexpr slot_id_t kTuples = 13;
+	constexpr std::size_t kLength = 150;
+	constexpr slot_id_t kTarget = 5;
 
-	std::vector<slot_id_t> slots;
-	for (size_t i = 0; i < 13; i++) {
-		auto slot_insert = page.Insert(Tuple(std::byte{29}, 150));
-		EXPECT_TRUE(slot_insert.has_value());
-		slots.push_back(slot_insert.value());
+	auto fill = [](slot_id_t i) { return static_cast<std::byte>(i + 1); };
+
+	HeapPage page = Page();
+	for (slot_id_t i = 0; i < kTuples; ++i) {
+		ASSERT_TRUE(page.Insert(Tuple(fill(i), kLength)).has_value());
 	}
 
-	auto st = page.Update(5, Tuple(std::byte{30}, 100));
+	// Tuples grow BACKWARD: Insert places each one at tuple_data_start - length and then lowers
+	// the mark, so a later slot sits at a LOWER offset. Slot 4 is therefore immediately ABOVE
+	// slot 5 in the body, and an in-place overwrite that runs long writes upward into it. Slot 6
+	// lives below slot 5 and cannot be reached by a forward write at all — checking only slot 6
+	// is checking the one neighbour that is safe no matter how badly Update overruns.
+	ASSERT_GT(page.SlotAt(kTarget - 1).offset, page.SlotAt(kTarget).offset);
+	ASSERT_GT(page.SlotAt(kTarget).offset, page.SlotAt(kTarget + 1).offset);
+
+	auto st = page.Update(kTarget, Tuple(std::byte{99}, 100));
 	ASSERT_TRUE(st.has_value());
 	ASSERT_EQ(st.value(), UpdateOutcome::kSamePage);
 
-	auto tuple_6 = page.Get(6);
-	ASSERT_TRUE(tuple_6.has_value());
-	ASSERT_EQ(AsChars(tuple_6.value()), AsChars(Tuple(std::byte{29}, 150)));
+	// The tuple itself: exactly 100 bytes of the new fill. A shrink that forgot to update the
+	// slot length would hand back 150 bytes with a 50-byte tail of stale data.
+	EXPECT_EQ(Read(page.Get(kTarget).value()), Tuple(std::byte{99}, 100));
+
+	// Every other tuple, each against its OWN fill, so a failure names the slot that moved.
+	for (slot_id_t i = 0; i < kTuples; ++i) {
+		if (i == kTarget) continue;
+		auto tuple = page.Get(i);
+		ASSERT_TRUE(tuple.has_value()) << "slot " << i;
+		EXPECT_EQ(Read(tuple.value()), Tuple(fill(i), kLength)) << "slot " << i;
+	}
+	EXPECT_TRUE(page.CheckInvariants());
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -642,40 +661,51 @@ TEST_F(HeapPageTest, UpdateOnAnOutOfRangeSlotIsNotFound) {
 // The real proof: delete alternating tuples, compact, and every survivor still reads back its
 // original bytes. That is what says the slot offsets were rewritten in lockstep with the bytes.
 TEST_F(HeapPageTest, CompactReclaimsDeletedBytesAndKeepsSurvivingRidsReadable) {
+	constexpr slot_id_t kTuples = 13;
+	constexpr std::size_t kLength = 50;
+
+	// A DISTINCT fill per tuple, and that is the whole test. With one shared fill every survivor
+	// reads back 50 identical bytes no matter which survivor's bytes it actually got, so a
+	// Compact that crossed two slots' offsets — wrote tuple 3 and pointed slot 7 at it — would
+	// pass. Crossed offsets are exactly the bug this test exists to find.
+	auto fill = [](slot_id_t i) { return static_cast<std::byte>(i + 1); };
+
 	HeapPage page = Page();
 	std::vector<slot_id_t> slots;
-	for (size_t i = 0; i < 13; i++) {
-		auto slot_id = page.Insert(Tuple(std::byte{29}, 50));
+	for (slot_id_t i = 0; i < kTuples; ++i) {
+		auto slot_id = page.Insert(Tuple(fill(i), kLength));
 		ASSERT_TRUE(slot_id.has_value());
 		slots.push_back(slot_id.value());
 	}
 
 	uint16_t dead_cnt{0};
-	for (size_t i = 0; i < 13; i++) {
-		if (i % 2) continue;
-		auto st = page.Delete(slots[i]);
-		EXPECT_EQ(st.code(), ErrorCode::kOk);
-		dead_cnt += st.code() == ErrorCode::kOk;
+	for (slot_id_t i = 0; i < kTuples; i += 2) {
+		ASSERT_TRUE(page.Delete(slots[i]).ok());
+		++dead_cnt;
 	}
 
-	uint16_t init_dead_bytes = page.Header().dead_bytes;
-	ASSERT_TRUE(init_dead_bytes > 0);
+	ASSERT_EQ(page.Header().dead_bytes, dead_cnt * kLength);
 	ASSERT_EQ(page.Header().slot_count - page.Header().live_count, dead_cnt);
 
 	page.Compact();
 
-	for (size_t i = 0; i < 13; i++) {
+	for (slot_id_t i = 0; i < kTuples; ++i) {
 		if (i % 2) {
 			auto tuple = page.Get(slots[i]);
-			EXPECT_TRUE(tuple.has_value());
-			EXPECT_EQ(AsChars(tuple.value()), AsChars(Tuple(std::byte{29}, 50)));
+			ASSERT_TRUE(tuple.has_value()) << "slot " << i << " should have survived";
+			EXPECT_EQ(Read(tuple.value()), Tuple(fill(i), kLength)) << "slot " << i;
 		} else {
-			auto slot = page.SlotAt(slots[i]);
-			EXPECT_TRUE(slot.IsDead());
+			EXPECT_TRUE(page.SlotAt(slots[i]).IsDead()) << "slot " << i;
 		}
 	}
 
-	ASSERT_TRUE(page.Header().dead_bytes == 0);
+	// Bytes move, slots never renumber; and the region is packed, which dead_bytes == 0 alone
+	// does not establish.
+	EXPECT_EQ(page.SlotCount(), kTuples);
+	EXPECT_EQ(page.LiveCount(), kTuples - dead_cnt);
+	EXPECT_EQ(page.Header().dead_bytes, 0);
+	EXPECT_EQ(page.Header().tuple_data_start, PAGE_BODY_SIZE - (kTuples - dead_cnt) * kLength);
+	EXPECT_TRUE(page.CheckInvariants());
 }
 
 // tuple_data_start lands exactly at PAGE_BODY_SIZE minus the sum of the live lengths.

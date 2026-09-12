@@ -198,6 +198,32 @@ next page of that table, and the guard already exposes `SetNextPageId`.
 
 The catalog holds each table's `first_page_id` and `last_page_id`.
 
+### API shape
+
+Four decisions the prose above does not pin down, recorded here because each one has a reason
+that is easy to lose.
+
+**`Create`/`Open` are factories returning `unique_ptr`.** Both can fail — `Create` allocates a
+page — so neither can be a constructor. `unique_ptr` rather than by value because the insert
+cursor is an `atomic<page_id_t>`, and an atomic member makes the class non-movable. Same shape,
+and same reason, as `DiskManager::Open`.
+
+**`Update` returns the row's NEW `RID`.** Case 3 relocates a row to another page and its identity
+changes. Returning `Result<RID>` makes every caller hold the new value; returning a `Status`
+would let a stale `RID` sit unnoticed in an index entry or a collected list, which is precisely
+the failure the RID contract exists to prevent.
+
+**`Get` returns a copy, never a span.** The guard drops when `Get` returns, the frame becomes
+evictable, and a span into the body then reads another page's bytes as valid memory — invisible
+to ASan. A buffer-filling overload can be added if per-row allocation ever matters; handing back
+a view cannot.
+
+**`TableIterator` is a cursor, not an STL iterator.** It holds a guard, so it is move-only and
+cannot satisfy `forward_iterator`; and advancing fetches a page, so it can fail, which
+`operator++` has no way to report. `Result<bool> Next()` plus `Rid()` and `Tuple()` states both
+facts instead of hiding them behind a sentinel and a throwing increment. `Tuple()` points into
+the iterator's own buffer — valid across the guard drop, invalidated by the next `Next()`.
+
 ### Insert and page extension — the one place two threads collide
 
 Insert takes a write guard on a candidate page and tries. If it fits, done. When every candidate
