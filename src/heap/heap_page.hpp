@@ -249,6 +249,11 @@ class HeapPage {
 	 * Reuse a dead slot if one exists, else append a new one. Copies the tuple to
 	 * tuple_data_start - len and lowers tuple_data_start.
 	 *
+	 * Rejects an empty tuple and anything over MAX_TUPLE_SIZE. The cap is checked here as well as
+	 * at CREATE TABLE and at SQL INSERT, so that no path above this layer can put an oversized
+	 * tuple on a page: the format's own limit is MAX_TUPLE_ON_EMPTY_PAGE, and a tuple between the
+	 * two would insert fine and then be unrelocatable for the rest of its life.
+	 *
 	 * Needs len + SLOT_SIZE if it must append a slot, or len alone if it reuses a dead one,
 	 * checked against Contiguous(). DOES NOT COMPACT: returns failure and lets the caller
 	 * decide between compacting and retrying, or moving to another page.

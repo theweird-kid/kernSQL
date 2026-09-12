@@ -157,6 +157,9 @@ Result<slot_id_t> HeapPage::Insert(std::span<const std::byte> tuple) {
 	if (tuple.empty()) {
 		return std::unexpected(Status::InvalidArgument("cannot insert a zero-length tuple"));
 	}
+	if (tuple.size() > MAX_TUPLE_SIZE) {
+		return std::unexpected(Status::InvalidArgument("tuple exceeds the maximum tuple size"));
+	}
 
 	auto header = Header();
 	slot_id_t slot_id = header.slot_count;
