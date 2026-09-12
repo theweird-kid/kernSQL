@@ -1,6 +1,8 @@
 #include "heap/heap_page.hpp"
 
+#include <array>
 #include <cassert>
+#include <cstdint>
 #include <cstring>
 #include <expected>
 #include <span>
@@ -144,8 +146,11 @@ bool ConstHeapPage::CheckInvariants() const {
 }
 
 void HeapPage::Init() {
-	HeapSubHeader sub_header{0, 0, 0, 0};
-	WriteHeader(sub_header);
+	// Value-initialised so every field comes from its default member initializer, which is the
+	// only way tuple_data_start starts at PAGE_BODY_SIZE. Spelling the zeros out instead OVERRIDES
+	// those initializers and leaves the low-water mark at 0, i.e. a page that reports no free
+	// space and fails its own accounting check the moment it is created.
+	WriteHeader(HeapSubHeader{});
 }
 
 Result<slot_id_t> HeapPage::Insert(std::span<const std::byte> tuple) {
@@ -215,13 +220,150 @@ Status HeapPage::Delete(slot_id_t slot_id) {
 	return Status::OK();
 }
 
-Result<UpdateOutcome> HeapPage::Update(slot_id_t /*slot*/, std::span<const std::byte> /*tuple*/) {
-	// TODO(heap)
-	return std::unexpected(Status::Internal("HeapPage::Update not implemented"));
+Result<UpdateOutcome> HeapPage::Update(slot_id_t slot_id, std::span<const std::byte> tuple) {
+	if (tuple.empty()) {
+		return std::unexpected(Status::InvalidArgument("cannot update to a zero-length tuple"));
+	}
+	if (tuple.size() > MAX_TUPLE_SIZE) {
+		return std::unexpected(Status::InvalidArgument("tuple exceeds the maximum tuple size"));
+	}
+
+	// Existence and liveness in one shot, with Get's error propagated unchanged: an update to a
+	// deleted RID is NotFound, not Corruption. The span it hands back is deliberately discarded —
+	// it is a const view, and every write below goes through the slot instead.
+	auto existing = Get(slot_id);
+	if (!existing.has_value()) return std::unexpected(existing.error());
+
+	auto slot = SlotAt(slot_id);
+	auto header = Header();
+
+	// One snapshot, taken before anything mutates, so the branch conditions below cannot end up
+	// comparing a stale header field against a freshly recomputed Contiguous().
+	const std::size_t contiguous = Contiguous();
+	const auto new_length = static_cast<uint16_t>(tuple.size());
+
+	UpdateOutcome outcome = UpdateOutcome::kSamePage;
+	if (slot.length >= new_length) {
+		// Case 1: overwrite in place. The tuple keeps its offset, so the bytes freed at the tail
+		// of the old extent are referenced by no slot and no offset; dead_bytes is the only
+		// record that they exist.
+		std::memcpy(body_.data() + slot.offset, tuple.data(), new_length);
+
+		header.dead_bytes = static_cast<uint16_t>(header.dead_bytes + (slot.length - new_length));
+		WriteHeader(header);
+
+		slot.length = new_length;
+		WriteSlot(slot_id, slot);
+	} else if (new_length <= contiguous) {
+		// Case 2, fast path: it grows, but there is room at the low-water mark, so relocate
+		// within the page and skip the compaction entirely. The slot index does not change.
+		header.dead_bytes = static_cast<uint16_t>(header.dead_bytes + slot.length);
+		header.tuple_data_start = static_cast<uint16_t>(header.tuple_data_start - new_length);
+
+		std::memcpy(body_.data() + header.tuple_data_start, tuple.data(), new_length);
+		WriteHeader(header);
+
+		slot.length = new_length;
+		slot.offset = header.tuple_data_start;
+		WriteSlot(slot_id, slot);
+	} else if (new_length <= contiguous + header.dead_bytes + slot.length) {
+		// Case 2, slow path: it fits only after reclaiming garbage. The `+ slot.length` term is
+		// this tuple's own bytes, which are about to become garbage themselves — which is why the
+		// test must be pure arithmetic run BEFORE any mutation, since case 3 has to leave the
+		// page untouched.
+		header.dead_bytes = static_cast<uint16_t>(header.dead_bytes + slot.length);
+		header.live_count = static_cast<uint16_t>(header.live_count - 1);
+		WriteHeader(header);
+
+		slot.offset = 0;
+		slot.length = 0;
+		WriteSlot(slot_id, slot);
+
+		// Killing first is what stops the compaction from copying bytes that are already
+		// abandoned. The slot is dead here while still logically live, which is safe only
+		// because the whole operation runs under one write latch.
+		Compact();
+
+		// Compact rewrote tuple_data_start and zeroed dead_bytes, so the local copy is stale.
+		header = Header();
+		header.tuple_data_start = static_cast<uint16_t>(header.tuple_data_start - new_length);
+		header.live_count = static_cast<uint16_t>(header.live_count + 1);
+
+		std::memcpy(body_.data() + header.tuple_data_start, tuple.data(), new_length);
+		WriteHeader(header);
+
+		slot.offset = header.tuple_data_start;
+		slot.length = new_length;
+		WriteSlot(slot_id, slot);
+	} else {
+		outcome = UpdateOutcome::kDoesNotFit;
+	}
+
+	assert(CheckInvariants());
+	return outcome;
 }
 
 void HeapPage::Compact() {
-	// TODO(heap)
+	auto header = Header();
+
+	// Nothing to reclaim, and that is provable rather than a guess. The accounting identity says
+	// tuple_data_start + live_bytes + dead_bytes == PAGE_BODY_SIZE, so zero garbage means the live
+	// tuples exactly fill the region, and non-overlapping tuples that exactly fill a region are
+	// already packed. Update's slow path calls this unconditionally, so the early exit is
+	// load-bearing rather than decorative.
+	if (header.dead_bytes == 0) return;
+
+	// Rebuilt in a scratch buffer and copied back in one shot, rather than slid in place. Sliding
+	// in place does work — descending offset order guarantees no tuple can land on one that has
+	// not moved yet — but it needs the live slots sorted by offset first and memmove throughout.
+	// Postgres shipped exactly that for years and then reversed it: compactify_tuples sorted and
+	// slid until PG14 rewrote it around a scratch buffer, which came out both simpler and faster.
+	// InnoDB's page reorganize copies via a temp block too.
+	//
+	// Left uninitialised on purpose. The loop writes every byte of [cursor, PAGE_BODY_SIZE) before
+	// the copy back reads it — cursor drops by exactly the length the loop then fills — so nothing
+	// uninitialised is ever read, and zeroing 4KB per compaction would be pure waste.
+	std::array<std::byte, PAGE_BODY_SIZE> scratch;
+	std::size_t cursor = PAGE_BODY_SIZE;
+
+	[[maybe_unused]] const auto freed_from = header.tuple_data_start;
+
+	for (slot_id_t i = 0; i < header.slot_count; ++i) {
+		Slot slot = SlotAt(i);
+
+		// A dead slot keeps its index forever so a stale RID still has something to resolve
+		// against. Compaction moves bytes; it never renumbers slots.
+		if (slot.IsDead()) continue;
+
+		cursor -= slot.length;
+		std::memcpy(scratch.data() + cursor, body_.data() + slot.offset, slot.length);
+
+		// Written inside the same pass that moved the bytes. The rule the whole format rests on is
+		// that no operation may move a tuple without updating its slot in the same breath.
+		slot.offset = static_cast<uint16_t>(cursor);
+		WriteSlot(i, slot);
+	}
+
+	// ONLY the occupied tail. Copying the whole buffer back would stamp over the free space and,
+	// below it, the slot array this loop just rewrote.
+	std::memcpy(body_.data() + cursor, scratch.data() + cursor, PAGE_BODY_SIZE - cursor);
+
+	// slot_count and live_count are deliberately untouched. Update's slow path depends on it: that
+	// code decrements live_count before calling here and restores it afterwards, so an adjustment
+	// in this function would leave the count off by one.
+	header.tuple_data_start = static_cast<uint16_t>(cursor);
+	header.dead_bytes = 0;
+	WriteHeader(header);
+
+#ifndef NDEBUG
+	// The band that just became free — exactly the old dead_bytes, and strictly inside the old
+	// tuple region, so it can never reach the slot array. Poisoning it turns a stale offset into
+	// obvious garbage instead of plausible-looking bytes, which is the difference between a loud
+	// failure and a silent wrong answer.
+	std::memset(body_.data() + freed_from, 0xDD, cursor - freed_from);
+#endif
+
+	assert(CheckInvariants());
 }
 
 }  // namespace kernsql
