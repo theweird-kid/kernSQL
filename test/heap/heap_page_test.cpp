@@ -6,14 +6,20 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
 #include <format>
+#include <memory>
+#include <iterator>
 #include <span>
 #include <string>
 #include <string_view>
 #include <vector>
 
+#include "buffer/buffer_pool_manager.hpp"
+#include "buffer/page_guard.hpp"
 #include "common/status.hpp"
 #include "common/types.hpp"
+#include "storage/disk_manager.hpp"
 
 namespace kernsql {
 
@@ -49,6 +55,19 @@ class HeapPageTest : public ::testing::Test {
 	// fails in a way that looks like a real mismatch.
 	static std::vector<std::byte> Read(std::span<const std::byte> bytes) {
 		return {bytes.begin(), bytes.end()};
+	}
+
+	// Stamp header and slot bytes straight into the body, bypassing every operation. ONLY for
+	// the CheckInvariants tests: their whole point is to hand that function a page the API
+	// cannot produce, and it is the HEADER that every operation reads, so scribbling tuple bytes
+	// would change nothing anything looks at.
+	void PokeHeader(const HeapSubHeader& header) {
+		header.WriteTo(std::span<std::byte, HEAP_SUB_HEADER_SIZE>{body_.data(),
+		                                                          HEAP_SUB_HEADER_SIZE});
+	}
+	void PokeSlot(slot_id_t slot, const Slot& entry) {
+		entry.WriteTo(std::span<std::byte, SLOT_SIZE>{
+		    body_.data() + HEAP_SUB_HEADER_SIZE + std::size_t{slot} * SLOT_SIZE, SLOT_SIZE});
 	}
 
 	std::array<std::byte, PAGE_BODY_SIZE> body_{};
@@ -555,24 +574,65 @@ TEST_F(HeapPageTest, UpdateViaCompactionLeavesLiveCountCorrect) {
 
 // kDoesNotFit, and the body must be BYTE-IDENTICAL to a snapshot taken before the call.
 TEST_F(HeapPageTest, UpdateThatCannotFitLeavesThePageByteIdentical) {
-	GTEST_SKIP() << "TODO";
+	HeapPage page = Page();
+
+	auto slot_1 = page.Insert(Tuple(std::byte{29}, 2000));
+	EXPECT_TRUE(slot_1.has_value());
+	auto slot_2 = page.Insert(Tuple(std::byte{29}, 2000));
+	EXPECT_TRUE(slot_2.has_value());
+	auto slot_3 = page.Insert(Tuple(std::byte{29}, 30));
+	EXPECT_TRUE(slot_3.has_value());
+
+	auto st = page.Update(slot_3.value(), Tuple(std::byte{30}, 2000));
+	EXPECT_EQ(st, UpdateOutcome::kDoesNotFit);
 }
 
 TEST_F(HeapPageTest, UpdateRejectsAZeroLengthTuple) {
-	GTEST_SKIP() << "TODO";
+	HeapPage page = Page();
+
+	auto slot = page.Insert(Tuple(std::byte{29}, 2000));
+	EXPECT_TRUE(slot.has_value());
+
+	auto st = page.Update(slot.value(), Tuple(std::byte{30}, 0));
+	EXPECT_FALSE(st.has_value());
+	EXPECT_EQ(st.error().code(), ErrorCode::kInvalidArgument);
 }
 
 TEST_F(HeapPageTest, UpdateRejectsATupleOverMaxTupleSize) {
-	GTEST_SKIP() << "TODO";
+	HeapPage page = Page();
+
+	auto slot = page.Insert(Tuple(std::byte{29}, 2000));
+	EXPECT_TRUE(slot.has_value());
+
+	auto st = page.Update(slot.value(), Tuple(std::byte{30}, 2300));
+	EXPECT_FALSE(st.has_value());
+	EXPECT_EQ(st.error().code(), ErrorCode::kInvalidArgument);
 }
 
 // Must be NotFound, not a resurrected slot and not Corruption.
 TEST_F(HeapPageTest, UpdateOnADeadSlotIsNotFound) {
-	GTEST_SKIP() << "TODO";
+	HeapPage page = Page();
+
+	auto slot = page.Insert(Tuple(std::byte{29}, 2000));
+	EXPECT_TRUE(slot.has_value());
+
+	auto st = page.Delete(slot.value());
+	ASSERT_EQ(st.code(), ErrorCode::kOk);
+
+	auto updated = page.Update(slot.value(), Tuple(std::byte{30}, 1800));
+	EXPECT_FALSE(updated.has_value());
+	EXPECT_EQ(updated.error().code(), ErrorCode::kNotFound);
 }
 
 TEST_F(HeapPageTest, UpdateOnAnOutOfRangeSlotIsNotFound) {
-	GTEST_SKIP() << "TODO";
+	HeapPage page = Page();
+
+	auto slot = page.Insert(Tuple(std::byte{29}, 2000));
+	EXPECT_TRUE(slot.has_value());
+
+	auto updated = page.Update(3, Tuple(std::byte{30}, 1800));
+	EXPECT_FALSE(updated.has_value());
+	EXPECT_EQ(updated.error().code(), ErrorCode::kNotFound);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -582,44 +642,262 @@ TEST_F(HeapPageTest, UpdateOnAnOutOfRangeSlotIsNotFound) {
 // The real proof: delete alternating tuples, compact, and every survivor still reads back its
 // original bytes. That is what says the slot offsets were rewritten in lockstep with the bytes.
 TEST_F(HeapPageTest, CompactReclaimsDeletedBytesAndKeepsSurvivingRidsReadable) {
-	GTEST_SKIP() << "TODO";
+	HeapPage page = Page();
+	std::vector<slot_id_t> slots;
+	for (size_t i = 0; i < 13; i++) {
+		auto slot_id = page.Insert(Tuple(std::byte{29}, 50));
+		ASSERT_TRUE(slot_id.has_value());
+		slots.push_back(slot_id.value());
+	}
+
+	uint16_t dead_cnt{0};
+	for (size_t i = 0; i < 13; i++) {
+		if (i % 2) continue;
+		auto st = page.Delete(slots[i]);
+		EXPECT_EQ(st.code(), ErrorCode::kOk);
+		dead_cnt += st.code() == ErrorCode::kOk;
+	}
+
+	uint16_t init_dead_bytes = page.Header().dead_bytes;
+	ASSERT_TRUE(init_dead_bytes > 0);
+	ASSERT_EQ(page.Header().slot_count - page.Header().live_count, dead_cnt);
+
+	page.Compact();
+
+	for (size_t i = 0; i < 13; i++) {
+		if (i % 2) {
+			auto tuple = page.Get(slots[i]);
+			EXPECT_TRUE(tuple.has_value());
+			EXPECT_EQ(AsChars(tuple.value()), AsChars(Tuple(std::byte{29}, 50)));
+		} else {
+			auto slot = page.SlotAt(slots[i]);
+			EXPECT_TRUE(slot.IsDead());
+		}
+	}
+
+	ASSERT_TRUE(page.Header().dead_bytes == 0);
 }
 
 // tuple_data_start lands exactly at PAGE_BODY_SIZE minus the sum of the live lengths.
 TEST_F(HeapPageTest, CompactPacksTheTupleRegionAgainstTheEndOfTheBody) {
-	GTEST_SKIP() << "TODO";
+	HeapPage page = Page();
+
+	constexpr size_t N = 13;
+	std::vector<slot_id_t> slots;
+	for (std::size_t i = 0; i < N; i++) {
+		auto slot = page.Insert(Tuple(std::byte{29}, 50));
+		EXPECT_TRUE(slot.has_value());
+		slots.push_back(slot.value());
+	}
+
+	uint16_t byte_cnt{0};
+	for (std::size_t i = 0; i < N; i++) {
+		if (i % 2) {
+			byte_cnt += 50;
+			continue;
+		}
+		auto st = page.Delete(slots[i]);
+		EXPECT_EQ(st.code(), ErrorCode::kOk);
+	}
+	page.Compact();
+	ASSERT_EQ(page.Header().tuple_data_start, PAGE_BODY_SIZE - byte_cnt);
 }
 
 // Bytes move, slots never renumber: slot_count and live_count come out unchanged and dead slots
 // are still dead at their original indices.
 TEST_F(HeapPageTest, CompactPreservesSlotCountAndLiveCount) {
-	GTEST_SKIP() << "TODO";
+	HeapPage page = Page();
+	constexpr size_t N{13};
+
+	for (size_t i = 0; i < N; i++) {
+		auto slot = page.Insert(Tuple(std::byte{29}, 50));
+		EXPECT_TRUE(slot.has_value());
+	}
+
+	for (size_t i = 0; i < N; i++) {
+		if (i % 3) continue;
+		auto st = page.Delete(static_cast<slot_id_t>(i));
+		EXPECT_EQ(st.code(), ErrorCode::kOk);
+	}
+
+	uint16_t init_slot_cnt = page.Header().slot_count;
+	uint16_t init_live_cnt = page.Header().live_count;
+
+	page.Compact();
+
+	ASSERT_EQ(init_slot_cnt, page.Header().slot_count);
+	ASSERT_EQ(init_live_cnt, page.Header().live_count);
 }
 
 // dead_bytes == 0 means already packed, so this must be a no-op rather than a 4KB shuffle.
 TEST_F(HeapPageTest, CompactOnAPackedPageChangesNothing) {
-	GTEST_SKIP() << "TODO";
+	constexpr slot_id_t kTuples = 5;
+	constexpr std::size_t kLength = 200;
+
+	HeapPage page = Page();
+	for (slot_id_t i = 0; i < kTuples; ++i) {
+		ASSERT_TRUE(page.Insert(Tuple(static_cast<std::byte>(i + 1), kLength)).has_value());
+	}
+
+	// The precondition the early-out rests on, and it is provable rather than incidental: the
+	// accounting identity says tuple_data_start + live_bytes + dead_bytes == PAGE_BODY_SIZE, so
+	// zero garbage means the live tuples exactly fill the region — and non-overlapping tuples
+	// that exactly fill a region are already packed.
+	ASSERT_EQ(page.Header().dead_bytes, 0);
+	ASSERT_EQ(page.Header().tuple_data_start, PAGE_BODY_SIZE - kTuples * kLength);
+
+	const std::array<std::byte, PAGE_BODY_SIZE> before = body_;
+
+	page.Compact();
+
+	// Byte-for-byte, which covers the header, the slot array and the tuple region in one shot.
+	// NOTE: this proves the RESULT is unchanged, not that the early-out branch was taken — a
+	// correct full compaction of an already-packed page produces exactly these bytes too. The
+	// branch itself is not observable from out here; see the test's comment above.
+	EXPECT_EQ(std::memcmp(before.data(), body_.data(), PAGE_BODY_SIZE), 0);
+
+	EXPECT_EQ(page.SlotCount(), kTuples);
+	EXPECT_EQ(page.LiveCount(), kTuples);
+	EXPECT_EQ(page.Header().dead_bytes, 0);
+	for (slot_id_t i = 0; i < kTuples; ++i) {
+		EXPECT_EQ(Read(page.Get(i).value()), Tuple(static_cast<std::byte>(i + 1), kLength));
+	}
+	EXPECT_TRUE(page.CheckInvariants());
 }
 
 TEST_F(HeapPageTest, CompactIsIdempotent) {
-	GTEST_SKIP() << "TODO";
+	constexpr slot_id_t kTuples = 6;
+	constexpr std::size_t kLength = 200;
+
+	HeapPage page = Page();
+	for (slot_id_t i = 0; i < kTuples; ++i) {
+		ASSERT_TRUE(page.Insert(Tuple(static_cast<std::byte>(i + 1), kLength)).has_value());
+	}
+	for (slot_id_t i = 1; i < kTuples; i += 2) {
+		ASSERT_TRUE(page.Delete(i).ok());
+	}
+	ASSERT_EQ(page.Header().dead_bytes, 3 * kLength);
+
+	page.Compact();
+	ASSERT_EQ(page.Header().dead_bytes, 0);
+	ASSERT_EQ(page.Header().tuple_data_start, PAGE_BODY_SIZE - 3 * kLength);
+
+	const std::array<std::byte, PAGE_BODY_SIZE> after_first = body_;
+
+	page.Compact();
+
+	// Byte-identical, which covers header, slot array and tuple region at once. This holds even
+	// with the dead_bytes == 0 early-out removed: a compaction of a packed page repacks it into
+	// the same offsets, so the second pass is a fixed point rather than merely a skipped call.
+	EXPECT_EQ(std::memcmp(after_first.data(), body_.data(), PAGE_BODY_SIZE), 0);
+
+	EXPECT_EQ(page.SlotCount(), kTuples);
+	EXPECT_EQ(page.LiveCount(), 3);
+	for (slot_id_t i = 0; i < kTuples; ++i) {
+		if (i % 2 == 0) {
+			EXPECT_EQ(Read(page.Get(i).value()), Tuple(static_cast<std::byte>(i + 1), kLength));
+		} else {
+			EXPECT_TRUE(page.SlotAt(i).IsDead());
+		}
+	}
+	EXPECT_TRUE(page.CheckInvariants());
 }
 
 TEST_F(HeapPageTest, CompactOnAnAllDeadPageResetsTheLowWaterMark) {
-	GTEST_SKIP() << "TODO";
+	constexpr slot_id_t kTuples = 4;
+	constexpr std::size_t kLength = 500;
+
+	HeapPage page = Page();
+	for (slot_id_t i = 0; i < kTuples; ++i) {
+		ASSERT_TRUE(page.Insert(Tuple(static_cast<std::byte>(i + 1), kLength)).has_value());
+	}
+	for (slot_id_t i = 0; i < kTuples; ++i) {
+		ASSERT_TRUE(page.Delete(i).ok());
+	}
+	ASSERT_EQ(page.Header().tuple_data_start, PAGE_BODY_SIZE - kTuples * kLength);
+
+	page.Compact();
+
+	// With no live tuples the loop copies nothing and the cursor never leaves its starting point,
+	// so the region collapses to empty and the mark goes all the way back.
+	EXPECT_EQ(page.Header().tuple_data_start, PAGE_BODY_SIZE);
+	EXPECT_EQ(page.Header().dead_bytes, 0);
+	EXPECT_EQ(page.LiveCount(), 0);
+
+	// Bytes move, slots never renumber — even when every one of them is dead and the page holds
+	// nothing. The array stays at full length so a stale RID still has something to resolve to.
+	EXPECT_EQ(page.SlotCount(), kTuples);
+	for (slot_id_t i = 0; i < kTuples; ++i) {
+		EXPECT_TRUE(page.SlotAt(i).IsDead());
+		EXPECT_EQ(page.Get(i).error().code(), ErrorCode::kNotFound);
+	}
+
+	// The space is genuinely back: everything but the sub-header and the surviving slot array.
+	EXPECT_EQ(page.Contiguous(), PAGE_BODY_SIZE - HEAP_SUB_HEADER_SIZE - kTuples * SLOT_SIZE);
+	EXPECT_EQ(page.Reclaimable(), page.Contiguous());
+	EXPECT_TRUE(page.CheckInvariants());
 }
 
 // The gap the other cases miss: a reused slot index has to survive a compaction underneath it.
 // Insert, delete a middle tuple, insert again (reusing that slot), then compact, and check every
 // live RID — the reused slot is the one whose offset is easiest to rewrite wrong.
 TEST_F(HeapPageTest, CompactAfterSlotReuseKeepsEveryRidReadable) {
-	GTEST_SKIP() << "TODO";
+	HeapPage page = Page();
+	ASSERT_TRUE(page.Insert(Tuple(std::byte{1}, 100)).has_value());   // slot 0
+	ASSERT_TRUE(page.Insert(Tuple(std::byte{2}, 200)).has_value());   // slot 1, about to die
+	ASSERT_TRUE(page.Insert(Tuple(std::byte{3}, 300)).has_value());   // slot 2
+	ASSERT_TRUE(page.Delete(1).ok());
+
+	// Reuses slot 1: the index is recycled but the tuple lands at the low-water mark, nowhere
+	// near where the old one was, so slot 1's offset now points somewhere unrelated to its index.
+	auto reused = page.Insert(Tuple(std::byte{4}, 250));
+	ASSERT_TRUE(reused.has_value());
+	ASSERT_EQ(*reused, 1);
+	ASSERT_EQ(page.Header().dead_bytes, 200);  // the reuse reclaimed the ENTRY, not the bytes
+
+	page.Compact();
+
+	// The reused slot is the one whose offset is easiest to rewrite wrong, because its index no
+	// longer matches its position in the tuple region at all.
+	EXPECT_EQ(Read(page.Get(0).value()), Tuple(std::byte{1}, 100));
+	EXPECT_EQ(Read(page.Get(1).value()), Tuple(std::byte{4}, 250));
+	EXPECT_EQ(Read(page.Get(2).value()), Tuple(std::byte{3}, 300));
+
+	EXPECT_EQ(page.SlotCount(), 3);
+	EXPECT_EQ(page.LiveCount(), 3);
+	EXPECT_EQ(page.Header().dead_bytes, 0);
+	EXPECT_EQ(page.Header().tuple_data_start, PAGE_BODY_SIZE - (100 + 250 + 300));
+	EXPECT_TRUE(page.CheckInvariants());
 }
 
 // The caller-driven contract end to end: Insert fails with PageFull, Reclaimable() says there is
 // room, Compact, and the same Insert now succeeds.
 TEST_F(HeapPageTest, InsertSucceedsAfterCompactWhenItPreviouslyFailed) {
-	GTEST_SKIP() << "TODO";
+	HeapPage page = Page();
+	ASSERT_TRUE(page.Insert(Tuple(std::byte{1}, MAX_TUPLE_SIZE)).has_value());
+	ASSERT_TRUE(page.Insert(Tuple(std::byte{2}, MAX_TUPLE_SIZE)).has_value());
+	ASSERT_TRUE(page.Delete(0).ok());
+
+	const auto wanted = Tuple(std::byte{9}, 1500);
+
+	// The contract end to end: Insert refuses, Reclaimable() says the space is there, and the
+	// caller — not Insert — decides to spend a compaction on it.
+	auto refused = page.Insert(wanted);
+	EXPECT_FALSE(refused.has_value());
+	EXPECT_EQ(refused.error().code(), ErrorCode::kPageFull);
+	ASSERT_LT(page.Contiguous(), wanted.size());
+	ASSERT_GE(page.Reclaimable(), wanted.size());
+
+	page.Compact();
+
+	auto accepted = page.Insert(wanted);
+	ASSERT_TRUE(accepted.has_value());
+	EXPECT_EQ(*accepted, 0);  // the dead slot's index is recycled, not appended to
+	EXPECT_EQ(Read(page.Get(*accepted).value()), wanted);
+	EXPECT_EQ(Read(page.Get(1).value()), Tuple(std::byte{2}, MAX_TUPLE_SIZE));
+	EXPECT_EQ(page.SlotCount(), 2);
+	EXPECT_EQ(page.LiveCount(), 2);
+	EXPECT_TRUE(page.CheckInvariants());
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -629,20 +907,97 @@ TEST_F(HeapPageTest, InsertSucceedsAfterCompactWhenItPreviouslyFailed) {
 // It must return false, not read out of bounds. Scribble a slot_count far past the 1014 ceiling
 // straight into the body and call it.
 TEST_F(HeapPageTest, CheckInvariantsRejectsAnImpossibleSlotCount) {
-	GTEST_SKIP() << "TODO";
+	// 5000 slots would need 20008 bytes of array in a 4064-byte body. CheckInvariants must say
+	// false rather than walk 5000 entries off the end of the page — it is the one function
+	// designed to be handed garbage, so it may not index anything it has not first bounded.
+	PokeHeader(HeapSubHeader{.slot_count = 5000,
+	                         .tuple_data_start = static_cast<uint16_t>(PAGE_BODY_SIZE),
+	                         .live_count = 0,
+	                         .dead_bytes = 0});
+	EXPECT_FALSE(View().CheckInvariants());
+
+	// Its companion guard, which runs first and is what bounds slot_count in the first place: a
+	// low-water mark past the end of the body.
+	SetUp();
+	PokeHeader(HeapSubHeader{
+	    .slot_count = 0, .tuple_data_start = 5000, .live_count = 0, .dead_bytes = 0});
+	EXPECT_FALSE(View().CheckInvariants());
 }
 
 TEST_F(HeapPageTest, CheckInvariantsRejectsALiveSlotPointingOutsideTheTupleRegion) {
-	GTEST_SKIP() << "TODO";
+	HeapPage page = Page();
+	ASSERT_TRUE(page.Insert(Tuple(std::byte{1}, 300)).has_value());
+	ASSERT_TRUE(page.CheckInvariants());
+
+	const Slot good = page.SlotAt(0);
+
+	// Below the low-water mark: the tuple claims bytes the page says are free space.
+	PokeSlot(0, Slot{static_cast<uint16_t>(good.offset - 10), good.length});
+	EXPECT_FALSE(View().CheckInvariants());
+
+	// Past the end of the body. This is the check that stops Get from handing out a span running
+	// off the page, which is why it is audited per slot here rather than on Get's hot path.
+	PokeSlot(0, good);
+	ASSERT_TRUE(page.CheckInvariants());
+	PokeSlot(0, Slot{good.offset, static_cast<uint16_t>(PAGE_BODY_SIZE)});
+	EXPECT_FALSE(View().CheckInvariants());
 }
 
 TEST_F(HeapPageTest, CheckInvariantsRejectsAMiscountedLiveCount) {
-	GTEST_SKIP() << "TODO";
+	HeapPage page = Page();
+	for (slot_id_t i = 0; i < 3; ++i) {
+		ASSERT_TRUE(page.Insert(Tuple(static_cast<std::byte>(i + 1), 100)).has_value());
+	}
+	ASSERT_TRUE(page.CheckInvariants());
+
+	HeapSubHeader header = page.Header();
+	const uint16_t truth = header.live_count;
+
+	// Too low, which is what a Delete that forgot to decrement's counterpart looks like...
+	header.live_count = static_cast<uint16_t>(truth - 1);
+	PokeHeader(header);
+	EXPECT_FALSE(View().CheckInvariants());
+
+	// ...and too high, which is what an Update that killed a slot and never restored it looks
+	// like. The field is maintained rather than derived, so only this cross-check catches drift.
+	header.live_count = static_cast<uint16_t>(truth + 1);
+	PokeHeader(header);
+	EXPECT_FALSE(View().CheckInvariants());
+}
+
+// Dead has exactly one representation, and only because Delete zeroes both fields. That is what
+// makes "offset == 0 implies length == 0" assertable at all, so it needs its own guard.
+TEST_F(HeapPageTest, CheckInvariantsRejectsADeadSlotWithANonZeroLength) {
+	HeapPage page = Page();
+	ASSERT_TRUE(page.Insert(Tuple(std::byte{1}, 150)).has_value());
+	ASSERT_TRUE(page.Delete(0).ok());
+	ASSERT_TRUE(page.CheckInvariants());
+
+	// A Delete that zeroed the offset but left the length behind — a dead slot in a second,
+	// illegal representation that no other check would look at, since the walk skips dead slots.
+	PokeSlot(0, Slot{0, 150});
+	EXPECT_FALSE(View().CheckInvariants());
 }
 
 // Overlapping tuples fall out of the byte-accounting sum with no pairwise comparison.
 TEST_F(HeapPageTest, CheckInvariantsRejectsOverlappingTuples) {
-	GTEST_SKIP() << "TODO";
+	HeapPage page = Page();
+	ASSERT_TRUE(page.Insert(Tuple(std::byte{1}, 300)).has_value());
+	ASSERT_TRUE(page.Insert(Tuple(std::byte{2}, 300)).has_value());
+	ASSERT_TRUE(page.CheckInvariants());
+
+	const uint16_t shared = page.SlotAt(0).offset;
+
+	// Point both live slots at the same 300 bytes and pull the low-water mark up to match, which
+	// is what a compaction that moved a tuple but rewrote the wrong slot would leave behind.
+	PokeSlot(1, Slot{shared, 300});
+	HeapSubHeader header = page.Header();
+	header.tuple_data_start = shared;
+	PokeHeader(header);
+
+	// No pairwise comparison anywhere: the overlap counts the shared bytes twice, so the live
+	// total overshoots the region and the accounting identity is the thing that notices.
+	EXPECT_FALSE(View().CheckInvariants());
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -651,11 +1006,76 @@ TEST_F(HeapPageTest, CheckInvariantsRejectsOverlappingTuples) {
 
 // Needs a real guard, so this pair reaches for a BufferPoolManager where nothing else here does.
 TEST_F(HeapPageTest, AsHeapPageRejectsAPageThatIsNotAHeapPage) {
-	GTEST_SKIP() << "TODO";
+	const auto path = std::filesystem::temp_directory_path() / "kernsql_asheap_reject_test";
+	std::filesystem::remove(path);
+	auto dm = DiskManager::Open(path);
+	ASSERT_TRUE(dm.has_value()) << dm.error().message();
+	{
+		BufferPoolManager bpm(**dm, 4);
+		{
+			auto guard = bpm.NewPage();
+			ASSERT_TRUE(guard.has_value()) << guard.error().message();
+			ASSERT_NE(guard->Header().page_type, PageType::HEAP);
+
+			// A HeapPage sees only the body, so it CANNOT check page_type. Build one over a
+			// non-heap page and it parses whatever is there as a sub-header and scribbles on it.
+			// The guard can see the header, which is the entire reason this function exists.
+			auto view = AsHeapPage(*guard);
+			EXPECT_FALSE(view.has_value());
+			EXPECT_EQ(view.error().code(), ErrorCode::kCorruption);
+		}
+		{
+			auto guard = bpm.FetchPageRead(1);  // the catalog page, reserved by DiskManager
+			ASSERT_TRUE(guard.has_value()) << guard.error().message();
+			auto view = AsHeapPage(*guard);
+			EXPECT_FALSE(view.has_value());
+			EXPECT_EQ(view.error().code(), ErrorCode::kCorruption);
+		}
+		EXPECT_TRUE(bpm.Shutdown().ok());
+	}
+	dm->reset();
+	std::filesystem::remove(path);
 }
 
 TEST_F(HeapPageTest, AsHeapPageAcceptsAHeapPage) {
-	GTEST_SKIP() << "TODO";
+	const auto path = std::filesystem::temp_directory_path() / "kernsql_asheap_accept_test";
+	std::filesystem::remove(path);
+	auto dm = DiskManager::Open(path);
+	ASSERT_TRUE(dm.has_value()) << dm.error().message();
+	{
+		BufferPoolManager bpm(**dm, 4);
+		page_id_t page_id{};
+		{
+			auto guard = bpm.NewPage();
+			ASSERT_TRUE(guard.has_value()) << guard.error().message();
+			page_id = guard->PageId();
+
+			// The caller stamps the type through the guard; this layer cannot see the header.
+			guard->SetPageType(PageType::HEAP);
+
+			auto view = AsHeapPage(*guard);
+			ASSERT_TRUE(view.has_value()) << view.error().message();
+
+			// And the span it handed back really is this page's body, not an offset copy of it.
+			view->Init();
+			auto slot = view->Insert(Bytes("through a real guard"));
+			ASSERT_TRUE(slot.has_value());
+			EXPECT_EQ(AsChars(view->Get(*slot).value()), "through a real guard");
+			EXPECT_TRUE(view->CheckInvariants());
+		}
+		{
+			// The const overload, over the same page after the write guard is gone.
+			auto guard = bpm.FetchPageRead(page_id);
+			ASSERT_TRUE(guard.has_value()) << guard.error().message();
+			auto view = AsHeapPage(*guard);
+			ASSERT_TRUE(view.has_value()) << view.error().message();
+			EXPECT_EQ(view->LiveCount(), 1);
+			EXPECT_EQ(AsChars(view->Get(0).value()), "through a real guard");
+		}
+		EXPECT_TRUE(bpm.Shutdown().ok());
+	}
+	dm->reset();
+	std::filesystem::remove(path);
 }
 
 }  // namespace kernsql
