@@ -11,7 +11,8 @@ add_library(kernsql_lib STATIC
   src/storage/disk_manager.cpp
   src/buffer/buffer_pool_manager.cpp
   src/buffer/page_guard.cpp
-  src/heap/heap_page.cpp)
+  src/heap/heap_page.cpp
+  src/heap/table_heap.cpp)
 target_include_directories(kernsql_lib PUBLIC src)
 target_compile_options(kernsql_lib PUBLIC -Wall -Wextra -Wpedantic -Wshadow -Wconversion
   -Werror=format)

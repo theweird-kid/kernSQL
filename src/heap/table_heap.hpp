@@ -51,6 +51,27 @@ class TableHeap;
  * bytes as valid memory — which ASan and valgrind both consider fine. Tuple() therefore points
  * into this iterator, stays valid across the guard drop, and is invalidated by the next Next().
  *
+ * > NEVER MUTATE THIS TABLE THROUGH A LIVE ITERATOR. IT WILL HANG.
+ *
+ * A successful Next() returns with the guard STILL HELD, so the calling thread is holding a
+ * shared content latch on the current row's page for as long as it looks at that row. The
+ * obvious loop —
+ *
+ *     while (*it.Next()) { if (pred(it.Tuple())) heap.Delete(it.Rid()); }
+ *
+ * — has Delete call FetchPageWrite on the page this same thread already holds a read latch on.
+ * The frame latch is a std::shared_mutex: not recursive, and no upgrade path. It blocks forever.
+ * One thread, no race, no interleaving; it hangs on the first matching row, every run.
+ *
+ * This is a HARDER constraint than the Halloween rule under TableHeap::Update and it is not the
+ * same rule. Halloween is about semantics — a relocated row being seen twice — and applies only
+ * to operations that can move a row. This applies to DELETE too, which relocates nothing. Both
+ * are satisfied by the same discipline: the executor collects RIDs to completion, lets the
+ * iterator die, and only then mutates.
+ *
+ * Worth a test precisely because the failure mode is a silent hang with no output, which is the
+ * least debuggable result a test suite can produce.
+ *
  * Deliberately NOT an STL iterator. It is move-only, so it cannot satisfy forward_iterator; and
  * advancing fetches a page, so it can fail, which operator++ has no way to report. A cursor with
  * a fallible Next() says both of those out loud instead of hiding them behind a sentinel and a
@@ -85,17 +106,25 @@ class TableIterator {
 	// ... WHERE needs it to name the row it matched, and a B+tree build needs {key -> RID} for
 	// every row — that pair IS the index's payload. Postgres carries t_self on every seqscan
 	// tuple for the same reason, with no caller opting in.
+	//
+	// Only meaningful once Next() has returned true. Before the first Next() the iterator is
+	// positioned before the first row and has no identity to report; after Next() returns false
+	// the page id is INVALID_PAGE, so the RID answers isValid() == false rather than naming a
+	// row that is not there.
 	[[nodiscard]] RID Rid() const;
 
 	// The current row's bytes. Points into this iterator, NOT into the page, and is invalidated
 	// by the next Next() — copy out anything that must outlive the step. Unlike the RID, which
 	// is a value and stays meaningful forever.
+	//
+	// Empty until Next() has returned true, for the same reason Rid() is meaningless until then.
 	[[nodiscard]] std::span<const std::byte> Tuple() const;
 
   private:
 	friend class TableHeap;
 
-	TableIterator(BufferPoolManager& bpm, page_id_t first_page_id);
+	TableIterator(BufferPoolManager& bpm, page_id_t first_page_id)
+	    : bpm_(&bpm), page_id_(first_page_id) {}
 
 	BufferPoolManager* bpm_;
 
@@ -103,8 +132,16 @@ class TableIterator {
 	// optional rather than an inert guard object.
 	std::optional<ReadPageGuard> guard_;
 
+	// "Not started" is a flag rather than slot_ = -1 because slot_id_t is UNSIGNED: -1 is 65535,
+	// which is a plausible slot index and not a sentinel below the first one.
+	bool initialized_{false};
+
 	page_id_t page_id_;
-	slot_id_t slot_;
+
+	// Zero-initialised so that Rid() on an unstarted iterator returns a wrong answer rather than
+	// reading an uninitialised member. Misuse should be diagnosable, not undefined.
+	slot_id_t slot_{0};
+
 	std::vector<std::byte> tuple_;
 };
 
@@ -190,6 +227,10 @@ class TableHeap {
 	 * (cmin/cmax); this engine has no visibility machinery, so the executor must collect RIDs to
 	 * completion first and only then apply. That rule is imposed by this layer and enforced
 	 * above it.
+	 *
+	 * TableIterator imposes a second and stricter reason for the same discipline: mutating
+	 * through a live iterator deadlocks on the read latch the iterator is still holding. That one
+	 * catches DELETE too, which relocates nothing and has no Halloween exposure. See TableIterator.
 	 *
 	 * kNotFound if the row is gone.
 	 */

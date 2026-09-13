@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <expected>
 #include <memory>
+#include <utility>
 
 #include "buffer/page_guard.hpp"
 #include "common/status.hpp"
@@ -11,6 +12,14 @@
 #include "heap/heap_page.hpp"
 
 namespace kernsql {
+
+TableHeap::TableHeap(BufferPoolManager& bpm, page_id_t first_page_id, page_id_t last_page_id)
+    : bpm_(bpm),
+      first_page_id_(first_page_id),
+      last_page_id_(last_page_id),
+      // DD-004: the cursor starts at the front of the chain, on Create and on Open alike. Nothing
+      // about it is persisted, so a restart simply begins the sweep again.
+      insert_hint_(first_page_id) {}
 
 Result<std::unique_ptr<TableHeap>> TableHeap::Create(BufferPoolManager& bpm) {
 	// alloacte first page and stamp as Heap
@@ -298,6 +307,111 @@ Result<RID> TableHeap::Update(RID rid, std::span<const std::byte> tuple) {
 
 TableIterator TableHeap::Scan() {
 	return TableIterator(bpm_, first_page_id_);
+}
+
+TableIterator::~TableIterator() = default;
+
+TableIterator::TableIterator(TableIterator&& other) noexcept
+    : bpm_(other.bpm_),
+      guard_(std::move(other.guard_)),
+      initialized_(other.initialized_),
+      page_id_(other.page_id_),
+      slot_(other.slot_),
+      tuple_(std::move(other.tuple_)) {
+	// Leave the source EXHAUSTED, not merely moved-from. Moving an optional leaves the source
+	// optional still engaged, holding a moved-from guard — harmless on its own, since Drop() on a
+	// null bpm_ does nothing — but an iterator that still names a page id is one that can be
+	// walked a second time over rows this iterator now owns.
+	other.guard_.reset();
+	other.page_id_ = INVALID_PAGE;
+}
+
+TableIterator& TableIterator::operator=(TableIterator&& other) noexcept {
+	if (this == &other) return *this;
+
+	// Release what THIS iterator is holding BEFORE taking the other's. Overwriting an engaged
+	// optional<ReadPageGuard> without dropping it strands a pin, and a stranded pin never becomes
+	// evictable again — that frame is lost to the pool for the life of the process.
+	guard_.reset();
+
+	bpm_ = other.bpm_;
+	guard_ = std::move(other.guard_);
+	initialized_ = other.initialized_;
+	page_id_ = other.page_id_;
+	slot_ = other.slot_;
+	tuple_ = std::move(other.tuple_);
+
+	other.guard_.reset();
+	other.page_id_ = INVALID_PAGE;
+	return *this;
+}
+
+Result<bool> TableIterator::Next() {
+	// Exhausted, or a scan of an empty chain. Idempotent on purpose: calling Next() past the end
+	// keeps answering false rather than walking off the slot array.
+	if (page_id_ == INVALID_PAGE) return false;
+
+	if (!initialized_) {
+		// Positioned BEFORE the first row, so the first call examines slot 0 rather than slot 1.
+		// This is why the "not started" state is a flag and not slot_ = -1: slot_id_t is
+		// unsigned, so -1 is 65535, not a sentinel below zero.
+		initialized_ = true;
+		slot_ = 0;
+	} else {
+		++slot_;
+	}
+
+	while (page_id_ != INVALID_PAGE) {
+		if (!guard_.has_value()) {
+			auto page = bpm_->FetchPageRead(page_id_);
+			if (!page.has_value()) return std::unexpected(page.error());
+			guard_.emplace(std::move(page.value()));
+		}
+
+		auto heap_page = AsHeapPage(guard_.value());
+		if (!heap_page.has_value()) return std::unexpected(heap_page.error());
+
+		// Skip a page with nothing live WITHOUT walking its slot array. This is the reason
+		// live_count is maintained rather than derived — a table that has been drained is mostly
+		// pages in exactly this state.
+		if (heap_page.value().LiveCount() > 0) {
+			const slot_id_t slot_count = heap_page.value().SlotCount();
+			for (; slot_ < slot_count; ++slot_) {
+				// SlotAt rather than Get for the liveness test: Get reports a dead slot with a
+				// Status, and Status carries a std::string, so probing dead slots through it
+				// would allocate once per hole on every scan.
+				if (heap_page.value().SlotAt(slot_).IsDead()) continue;
+
+				auto bytes = heap_page.value().Get(slot_);
+				if (!bytes.has_value()) return std::unexpected(bytes.error());
+
+				// COPY OUT. The span points into the frame, and the guard is dropped the moment
+				// this page is exhausted; the frame is then evictable and those bytes become
+				// some other page's, still-valid memory that no sanitizer flags. assign reuses
+				// the vector's capacity, so this is not an allocation per row.
+				tuple_.assign(bytes.value().begin(), bytes.value().end());
+				return true;
+			}
+		}
+
+		// Page exhausted. Read the link BEFORE dropping the guard — it lives in the header this
+		// guard is holding — then release it and move on. ONE GUARD AT A TIME: a scan that kept
+		// a pin per visited page would exhaust a fixed-size pool and then fail to fetch the next
+		// page of its own table.
+		page_id_ = guard_.value().Header().next_page_id;
+		guard_.reset();
+		slot_ = 0;
+	}
+
+	return false;
+}
+
+RID TableIterator::Rid() const {
+	return RID(page_id_, slot_);
+}
+
+std::span<const std::byte> TableIterator::Tuple() const {
+	return tuple_;
 }
 
 }  // namespace kernsql
