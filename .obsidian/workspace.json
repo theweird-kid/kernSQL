@@ -188,6 +188,7 @@
   },
   "active": "213624f19b44c94b",
   "lastOpenFiles": [
+    "src/heap/table_heap.cpp",
     "build/debug/Testing/Temporary/CTestCostData.txt.tmp",
     "build/debug/Testing/Temporary/CTestCheckpoint.txt",
     "build/debug/Testing/Temporary/LastTest.log.tmp",
@@ -198,7 +199,6 @@
     "build/debug/stYDWng5",
     "build/debug/st9bfCLl",
     "build/debug/stOW72hO",
-    "build/debug/st7oAlDh",
     "design-docs/DD-002-buffer-pool-manager.md",
     "design-docs/DD-003-threading-model.md",
     "design-docs/DD-002-buffer-manager.md",
