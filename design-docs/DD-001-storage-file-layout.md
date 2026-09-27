@@ -53,12 +53,19 @@ the catalog means following `next_page_id` from page 1 until `INVALID_PAGE`.
 
 > **A page is in at most one chain at a time, and `page_type` decides which chain that is.**
 > `FREE` → the next free page in the freelist. `HEAP` or `CATALOG` → the next page of that
-> object. `INDEX_LEAF` → the right sibling. There is no page state in which two of those
+> object. Every other page type leaves it `INVALID_PAGE`. There is no page state in which two of those
 > readings are simultaneously valid, which is what makes one field safe to share across all of
 > them: a page leaves its old chain in the same operation that changes its `page_type`.
 > `DeallocatePage` is the concrete case — it stamps `FREE` and threads the page onto the
 > freelist together, so the heap link it used to hold is gone by the time anyone can read the
 > field as a freelist link.
+
+These chains answer one question — *which pages belong to this object* — and that is the only
+question `next_page_id` is for. B+tree leaf siblings were originally listed here too and were
+moved out by [DD-005](./DD-005-b-plus-tree.md): the leaf chain is key order *inside* a tree, not
+page ownership (the header page and internal nodes are not on it, and splits and merges rewire it
+constantly), so it lives in the leaf's own sub-header, as Postgres keeps `btpo_next` in nbtree's
+special space.
 
 Index root pages are the one exception to "storage doesn't know about layout": since a
 B+tree's root page can change across root splits, it cannot be a fixed well-known page like
@@ -119,5 +126,6 @@ tuple bytes and update a slot's offset without invalidating any RID that points 
   to land on those two byte values, and can't detect a format version mismatch.
 - Whether index-node key storage is fixed-size (leveraging `VARCHAR(n)`'s declared bound) or
   uses a slotted variable-length format like heap pages — left to the B+tree design doc.
-- Whether internal (non-leaf) index nodes also carry a right-sibling `next_page_id` for
-  B-link–style crabbing, or only leaves — left to the B+tree design doc.
+- ~~Whether internal (non-leaf) index nodes also carry a right-sibling `next_page_id` for
+  B-link–style crabbing, or only leaves.~~ Closed by DD-005: sibling links live in the node
+  sub-header, not the page header; leaves only, right link only.

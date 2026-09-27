@@ -55,7 +55,8 @@ enum class PageType : uint8_t {
 	HEAP,
 	ALLOCATED,
 	FREE,
-	CATALOG
+	CATALOG,
+	INDEX_HEADER  // DD-005: holds one index's root page id. Not "META" — that is the superblock.
 };
 
 }  // namespace kernsql

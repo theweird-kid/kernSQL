@@ -42,11 +42,13 @@ struct PageHeader {
 	// BufferPoolManager::NewPage for the one page that is created without ever being read.
 	page_id_t page_id{INVALID_PAGE};
 
-	// Doubles as the disk freelist link (DD-001) and, later, the B+tree leaf sibling pointer.
-	// Postgres keeps sibling pointers in per-page-type special space at the end of the page
-	// rather than in the shared header, since only some page types have siblings. This is a
-	// deliberate deviation: the freelist is already built on it, and 8 bytes for next+prev is
-	// 0.2% of a page.
+	// The page-ownership chain (DD-001): the disk freelist link on a FREE page, the next page of
+	// the object on a HEAP or CATALOG page, INVALID_PAGE on every other type. It answers "which
+	// pages belong to this object" and nothing else.
+	//
+	// NOT the B+tree leaf sibling link. That is key order inside a tree, not ownership, and it
+	// lives in the node's own sub-header (DD-005) — where Postgres keeps btpo_next too, in
+	// nbtree's per-page special space rather than the shared header.
 	page_id_t next_page_id{INVALID_PAGE};
 	page_id_t prev_page_id{INVALID_PAGE};
 

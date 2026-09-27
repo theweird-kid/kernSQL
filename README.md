@@ -36,7 +36,7 @@ repository.
 | `HeapPage` — slotted page, stable RIDs across compaction | done, tested |
 | `TableHeap` — page chain, free-space reuse, concurrent inserts, forward scan | done, tested (incl. concurrency) |
 | Shell — REPL over the buffer pool and table heap, one command per operation | done |
-| B+tree — unique `int64` keys, split, merge/redistribute, range scan | **in design** ([DD-005](design-docs/)) |
+| B+tree — unique `int64` keys, split, merge/redistribute, range scan | **in design** ([DD-005](design-docs/DD-005-b-plus-tree.md)) |
 | Catalog | planned |
 | Parser, binder, executor | planned |
 | Join algorithms — nested-loop, index nested-loop, hash, sort-merge | planned |
@@ -150,7 +150,7 @@ The reasoning behind each component, including rejected alternatives:
 - [DD-002 — Buffer pool: concurrency and latching](design-docs/DD-002-buffer-pool-manager.md)
 - [DD-003 — Threading and execution model](design-docs/DD-003-threading-model.md)
 - [DD-004 — Heap pages and table heap](design-docs/DD-004-heap-pages-and-table-heap.md)
-- DD-005 — B+tree *(in progress)*
+- [DD-005 — B+tree index](design-docs/DD-005-b-plus-tree.md) *(draft)*
 
 ## Project layout
 
