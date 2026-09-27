@@ -36,7 +36,38 @@ uint16_t ConstLeafNode::LowerBound(index_key_t key) const {
 	return lo;
 }
 
-// Node-local checks only: count <= NODE_CAPACITY, level == 0, keys strictly increasing.
+// Node-local checks only: count <= NODE_CAPACITY, level == 0, next_page_id is INVALID_PAGE or
+// a non-reserved page (which also catches a leaf nobody Init()ed), every RID valid, keys strictly
+// increasing.
 // Occupancy against the fanout, the separator bounds and the chain's order are tree-level and
 // live in BPlusTree::CheckInvariants.
-bool ConstLeafNode::CheckInvariants() const {}
+bool ConstLeafNode::CheckInvariants() const {
+	// One header read, so every check below judges the same snapshot.
+	const NodeSubHeader header = Header();
+
+	// FIRST, and returning rather than recording: a count past the capacity means the entry loop
+	// below would walk off the body. Nothing after this line is safe to evaluate until it passes.
+	if (header.count > NODE_CAPACITY) return false;
+
+	if (header.level != 0) return false;
+
+	// A sibling link can be "none" or a real data page, never a reserved page. This is also the
+	// check that catches a leaf nobody called Init() on: a zeroed sub-header reads next_page_id 0,
+	// which is META_PAGE_ID — the same trick as HeapPage's tuple_data_start, where zeroed and
+	// initialised differ in exactly one field.
+	if (header.next_page_id != INVALID_PAGE && header.next_page_id <= CATALOG_ROOT_PAGE_ID) {
+		return false;
+	}
+
+	for (uint16_t i = 0; i < header.count; ++i) {
+		const LeafEntry entry = EntryAt(i);
+
+		// A default-constructed RID names INVALID_PAGE; one stored here points no row anywhere.
+		if (!entry.rid.isValid()) return false;
+
+		// STRICTLY increasing: keys are unique, so an equal neighbour is a duplicate that slipped
+		// past Insert's check, and a smaller one is a mis-sorted insert or a bad split.
+		if (i > 0 && EntryAt(static_cast<uint16_t>(i - 1)).key >= entry.key) return false;
+	}
+	return true;
+}

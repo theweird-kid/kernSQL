@@ -188,6 +188,7 @@
   },
   "active": "213624f19b44c94b",
   "lastOpenFiles": [
+    "src/indices/b_plus_tree_page.cpp.tmp.12586.ff70505743db",
     "src/indices/b_plus_tree_page.cpp.tmp.12586.470c118cd38c",
     "build/asan/CMakeFiles/buffer_pool_manager_test.dir/test/buffer/buffer_pool_manager_test.cpp.o.d",
     "build/asan/CMakeFiles/disk_manager_test.dir/test/storage/disk_manager_test.cpp.o.d",
@@ -198,7 +199,6 @@
     "build/asan/CMakeFiles/kernsql_lib.dir/src/storage/disk_manager.cpp.o.d",
     "build/asan/CMakeFiles/kernsql_lib.dir/src/heap/table_heap.cpp.o.d",
     "build/asan/CMakeFiles/kernsql_lib.dir/src/buffer/page_guard.cpp.o.d",
-    "build/asan/CMakeFiles/kernsql_lib.dir/src/heap/heap_page.cpp.o.d",
     "design-docs/DD-004-heap-pages-and-table-heap.md",
     "design-docs/DD-005-b-plus-tree.md",
     "design-docs/DD-002-buffer-pool-manager.md",

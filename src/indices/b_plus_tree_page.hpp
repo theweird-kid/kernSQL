@@ -257,7 +257,9 @@ class ConstLeafNode {
 	// The right sibling, INVALID_PAGE for the rightmost leaf.
 	[[nodiscard]] page_id_t NextLeaf() const { return Header().next_page_id; }
 
-	// Node-local checks only: count <= NODE_CAPACITY, level == 0, keys strictly increasing.
+	// Node-local checks only: count <= NODE_CAPACITY, level == 0, next_page_id is INVALID_PAGE or
+	// a non-reserved page (which also catches a leaf nobody Init()ed), every RID valid, keys strictly
+	// increasing.
 	// Occupancy against the fanout, the separator bounds and the chain's order are tree-level and
 	// live in BPlusTree::CheckInvariants.
 	[[nodiscard]] bool CheckInvariants() const;
