@@ -1035,7 +1035,7 @@ TEST_F(TableHeapTest, ConcurrentInsertsAllLandExactlyOnce) {
 	std::atomic<int> failures{0};
 	std::barrier start(kThreads);
 	{
-		std::vector<std::jthread> threads;
+		std::vector<std::thread> threads;
 		for (int t = 0; t < kThreads; ++t) {
 			threads.emplace_back([&, t] {
 				Rows& mine = per_thread[static_cast<std::size_t>(t)];
@@ -1051,7 +1051,8 @@ TEST_F(TableHeapTest, ConcurrentInsertsAllLandExactlyOnce) {
 				}
 			});
 		}
-	}  // joined
+		for (auto& thread : threads) thread.join();
+	}
 
 	ASSERT_EQ(failures.load(), 0);
 
@@ -1095,7 +1096,7 @@ TEST_F(TableHeapTest, ConcurrentChainExtensionLeaksNoPage) {
 	std::atomic<int> failures{0};
 	std::barrier round(kThreads);
 	{
-		std::vector<std::jthread> threads;
+		std::vector<std::thread> threads;
 		for (int t = 0; t < kThreads; ++t) {
 			threads.emplace_back([&, t] {
 				Rows& mine = per_thread[static_cast<std::size_t>(t)];
@@ -1113,7 +1114,8 @@ TEST_F(TableHeapTest, ConcurrentChainExtensionLeaksNoPage) {
 				}
 			});
 		}
-	}  // joined
+		for (auto& thread : threads) thread.join();
+	}
 
 	ASSERT_EQ(failures.load(), 0);
 
@@ -1157,7 +1159,7 @@ TEST_F(TableHeapTest, ConcurrentInsertAndDeleteKeepPageAccountingSound) {
 	std::atomic<int> failures{0};
 	std::barrier start(kDeleters + kInserters);
 	{
-		std::vector<std::jthread> threads;
+		std::vector<std::thread> threads;
 		for (int d = 0; d < kDeleters; ++d) {
 			threads.emplace_back([&, d] {
 				start.arrive_and_wait();
@@ -1178,7 +1180,8 @@ TEST_F(TableHeapTest, ConcurrentInsertAndDeleteKeepPageAccountingSound) {
 				}
 			});
 		}
-	}  // joined
+		for (auto& thread : threads) thread.join();
+	}
 
 	ASSERT_EQ(failures.load(), 0);
 	ExpectAllInvariants();
