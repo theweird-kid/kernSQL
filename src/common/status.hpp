@@ -13,6 +13,7 @@ enum class ErrorCode : uint8_t {
 	kIOError,
 	kInvalidArgument,
 	kBufferPoolFull,
+	kPageFull,
 	kDuplicateKey,
 	kSerializationConflict,
 	kInternal,
@@ -30,6 +31,10 @@ class [[nodiscard]] Status {
 	static Status BufferPoolFull(std::string msg) {
 		return {ErrorCode::kBufferPoolFull, std::move(msg)};
 	}
+	// A page has no room for the write. Distinct from kBufferPoolFull, which means the pool has
+	// no free frame: that one is fatal to the operation, this one is a routing decision — the
+	// caller can compact this page and retry, or place the row on a different page.
+	static Status PageFull(std::string msg) { return {ErrorCode::kPageFull, std::move(msg)}; }
 	static Status DuplicateKey(std::string msg) {
 		return {ErrorCode::kDuplicateKey, std::move(msg)};
 	}

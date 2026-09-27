@@ -13,12 +13,12 @@
             "state": {
               "type": "markdown",
               "state": {
-                "file": "design-docs/DD-002-buffer-pool-manager.md",
+                "file": "design-docs/DD-004-heap-pages-and-table-heap.md",
                 "mode": "preview",
                 "source": false
               },
               "icon": "lucide-file",
-              "title": "DD-002-buffer-pool-manager"
+              "title": "DD-004-heap-pages-and-table-heap"
             }
           }
         ]
@@ -188,19 +188,19 @@
   },
   "active": "213624f19b44c94b",
   "lastOpenFiles": [
-    "build/debug/CMakeFiles/kernsql.dir/link.d",
-    "build/debug/stt8jRT2",
-    "build/debug/stTk6Uc9",
-    "build/debug/CMakeFiles/kernsql_lib.dir/src/buffer/buffer_pool_manager.cpp.o.d",
-    "src/buffer/buffer_pool_manager.cpp.tmp.16764.7acecd0a7cef",
-    "src/buffer/buffer_pool_manager.cpp.tmp.16764.6d12f137211c",
-    "build/debug/stB1ka1L",
-    "build/debug/stMIkJFI",
-    "build/debug/stCuaJp3",
-    "build/debug/stI9cO3C",
-    "build/debug/CMakeFiles/kernsql_lib.dir/src/buffer/page_guard.cpp.o.d",
-    "design-docs/DD-003-threading-model.md",
+    "test/heap/table_heap_test.cpp",
+    "test/heap/table_heap_test.cpp.tmp.18698.cd124d9f8f82",
+    "build/debug/lib/stSWVPH6",
+    "build/debug/lib/stX2r8JG",
+    "build/debug/lib/st86nMd7",
+    "build/debug/lib/stOHmJLK",
+    "build/debug/lib/stl0srJW",
+    "build/debug/lib/stiFWUPf",
+    "build/debug/lib/staf5uB5",
+    "build/debug/lib/stwxl6qH",
+    "build/debug/_deps/googletest-build/googletest/CMakeFiles/gtest.dir/src/gtest-all.cc.o.d",
     "design-docs/DD-002-buffer-pool-manager.md",
+    "design-docs/DD-003-threading-model.md",
     "design-docs/DD-002-buffer-manager.md",
     "design-docs/notes/Buffer-Pool-Manager.md",
     "design-docs.md",

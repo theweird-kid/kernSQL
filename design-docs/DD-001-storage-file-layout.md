@@ -51,6 +51,15 @@ single page (the catalog first, but every heap table and index eventually) grows
 current last page. Page 1 is only the catalog's *first* page, not its full extent — scanning
 the catalog means following `next_page_id` from page 1 until `INVALID_PAGE`.
 
+> **A page is in at most one chain at a time, and `page_type` decides which chain that is.**
+> `FREE` → the next free page in the freelist. `HEAP` or `CATALOG` → the next page of that
+> object. `INDEX_LEAF` → the right sibling. There is no page state in which two of those
+> readings are simultaneously valid, which is what makes one field safe to share across all of
+> them: a page leaves its old chain in the same operation that changes its `page_type`.
+> `DeallocatePage` is the concrete case — it stamps `FREE` and threads the page onto the
+> freelist together, so the heap link it used to hold is gone by the time anyone can read the
+> field as a freelist link.
+
 Index root pages are the one exception to "storage doesn't know about layout": since a
 B+tree's root page can change across root splits, it cannot be a fixed well-known page like
 page 1. Each index's current root page id is stored as mutable data in the catalog, not in
@@ -64,12 +73,19 @@ offset 0, so the format is uniform regardless of what currently owns the page.
 | Field | Type | Size | Purpose |
 |---|---|---|---|
 | `page_type` | `uint8_t` (enum) | 1 | Distinguishes meta / heap / index-internal / index-leaf / free. Lets any page be sanity-checked against how it's being interpreted. |
-| `next_page_id` | `page_id_t` (int32) | 4 | Forward chain link. Meaning depends on `page_type`: next page in a heap/catalog chain, next free page in the freelist, or right-sibling for a B+tree node (leaf range scans and B-link–style crabbing reuse this same field). |
+| `flags` | `uint8_t` | 1 | Reserved; always zero. |
+| `format_version` | `uint16_t` | 2 | `PAGE_FORMAT_VERSION`. Stamped on every header written; nothing reads it back yet, which is the point — a future format change has a discriminator to branch on. |
+| `page_id` | `page_id_t` (int32) | 4 | The page's own id, redundant with the offset it was read from and redundant on purpose: derive identity from the offset alone and a disagreement is undetectable by construction. Catches misdirected writes, off-by-one page arithmetic, torn extends. InnoDB's `FIL_PAGE_OFFSET`. |
+| `next_page_id` | `page_id_t` (int32) | 4 | Forward chain link. Which chain is decided by `page_type` — see the invariant above. |
 | `prev_page_id` | `page_id_t` (int32) | 4 | Reserved for future backward traversal. Unused today. |
-| `page_lsn` | `lsn_t` (uint64) | 8 | LSN of the last WAL record applied to this page. Enables idempotent redo during recovery (skip reapplying a log record if `page_lsn >= record_lsn`) and is the field the buffer pool's write-ahead rule will check before flushing a dirty page. Populated in this branch even though WAL itself lands later, to avoid a page-format break. |
+| `page_lsn` | `lsn_t` (uint64) | 8 | LSN of the last WAL record applied to this page. Enables idempotent redo during recovery (skip reapplying a log record if `page_lsn >= record_lsn`) and is the field the buffer pool's write-ahead rule will check before flushing a dirty page. Reserved even though no WAL is planned, to avoid a page-format break. |
+| `checksum` | `uint32_t` | 4 | Reserved. See Non-goals. |
+| `reserved` | `uint32_t` | 4 | Padding, explicit rather than implicit so `ReadFrom`/`WriteTo` move a fully-defined 32 bytes. |
 
-Total: ~17 bytes, aligned to 24 bytes. Leaves ~4072 bytes of `PAGE_SIZE` for page-type-specific
-content (slot directory + tuple data for heap pages, key/pointer arrays for index pages).
+Total: exactly **32 bytes** (`PAGE_HEADER_SIZE`), asserted in `page_header.hpp`. Field order is
+chosen so every member lands on its natural alignment with no implicit padding. That leaves
+**4064 bytes** (`PAGE_BODY_SIZE`) for page-type-specific content — and 4064, not 4096, is what a
+page guard hands out, so no caller above the buffer pool can name the header bytes as raw memory.
 
 For heap pages specifically, that remaining space is a slotted page: a slot directory grows
 forward from right after the header, tuple data grows backward from the end of the page, and
