@@ -647,7 +647,7 @@ Status BufferPoolManager::DeletePage(page_id_t page_id) {
 			if (frame.pin_count_ != 0) {
 				return Status::InvalidArgument(
 				    std::format("page {} is pinned ({} holders) and cannot be deleted", page_id,
-					            frame.pin_count_));
+				                frame.pin_count_));
 			}
 			assert(frame.state_ == FrameState::Resident);
 

@@ -248,7 +248,8 @@ void CmdTablePurge(TableHeap& heap, std::string_view needle) {
 				return;
 			}
 			if (!*more) break;
-			if (AsText(it.Tuple()).find(needle) != std::string_view::npos) matched.push_back(it.Rid());
+			if (AsText(it.Tuple()).find(needle) != std::string_view::npos)
+				matched.push_back(it.Rid());
 		}
 	}
 
@@ -382,8 +383,7 @@ bool Dispatch(BufferPoolManager& bpm, DiskManager& dm, std::unique_ptr<TableHeap
 		if (auto* t = needs_table(); t && needs_rid(rid)) CmdTableUpdate(*t, rid, rest);
 	} else if (cmd == "tdelete") {
 		RID rid{};
-		if (auto* t = needs_table(); t && needs_rid(rid))
-			PrintStatus("tdelete", t->Delete(rid));
+		if (auto* t = needs_table(); t && needs_rid(rid)) PrintStatus("tdelete", t->Delete(rid));
 	} else if (cmd == "tscan") {
 		if (auto* t = needs_table()) CmdTableScan(*t);
 	} else if (cmd == "tfill") {
