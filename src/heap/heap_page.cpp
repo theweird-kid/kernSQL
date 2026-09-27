@@ -220,6 +220,7 @@ Status HeapPage::Delete(slot_id_t slot_id) {
 	delete_slot.offset = 0;
 	WriteSlot(slot_id, delete_slot);
 
+	assert(CheckInvariants());
 	return Status::OK();
 }
 

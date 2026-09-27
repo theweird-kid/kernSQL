@@ -6,7 +6,6 @@
 #include <atomic>
 #include <barrier>
 #include <cstddef>
-#include <cstdint>
 #include <filesystem>
 #include <format>
 #include <functional>

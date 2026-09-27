@@ -9,7 +9,6 @@
 #include <filesystem>
 #include <format>
 #include <memory>
-#include <iterator>
 #include <span>
 #include <string>
 #include <string_view>
@@ -62,8 +61,8 @@ class HeapPageTest : public ::testing::Test {
 	// cannot produce, and it is the HEADER that every operation reads, so scribbling tuple bytes
 	// would change nothing anything looks at.
 	void PokeHeader(const HeapSubHeader& header) {
-		header.WriteTo(std::span<std::byte, HEAP_SUB_HEADER_SIZE>{body_.data(),
-		                                                          HEAP_SUB_HEADER_SIZE});
+		header.WriteTo(
+		    std::span<std::byte, HEAP_SUB_HEADER_SIZE>{body_.data(), HEAP_SUB_HEADER_SIZE});
 	}
 	void PokeSlot(slot_id_t slot, const Slot& entry) {
 		entry.WriteTo(std::span<std::byte, SLOT_SIZE>{
@@ -873,9 +872,9 @@ TEST_F(HeapPageTest, CompactOnAnAllDeadPageResetsTheLowWaterMark) {
 // live RID — the reused slot is the one whose offset is easiest to rewrite wrong.
 TEST_F(HeapPageTest, CompactAfterSlotReuseKeepsEveryRidReadable) {
 	HeapPage page = Page();
-	ASSERT_TRUE(page.Insert(Tuple(std::byte{1}, 100)).has_value());   // slot 0
-	ASSERT_TRUE(page.Insert(Tuple(std::byte{2}, 200)).has_value());   // slot 1, about to die
-	ASSERT_TRUE(page.Insert(Tuple(std::byte{3}, 300)).has_value());   // slot 2
+	ASSERT_TRUE(page.Insert(Tuple(std::byte{1}, 100)).has_value());  // slot 0
+	ASSERT_TRUE(page.Insert(Tuple(std::byte{2}, 200)).has_value());  // slot 1, about to die
+	ASSERT_TRUE(page.Insert(Tuple(std::byte{3}, 300)).has_value());  // slot 2
 	ASSERT_TRUE(page.Delete(1).ok());
 
 	// Reuses slot 1: the index is recycled but the tuple lands at the low-water mark, nowhere
@@ -949,8 +948,8 @@ TEST_F(HeapPageTest, CheckInvariantsRejectsAnImpossibleSlotCount) {
 	// Its companion guard, which runs first and is what bounds slot_count in the first place: a
 	// low-water mark past the end of the body.
 	SetUp();
-	PokeHeader(HeapSubHeader{
-	    .slot_count = 0, .tuple_data_start = 5000, .live_count = 0, .dead_bytes = 0});
+	PokeHeader(
+	    HeapSubHeader{.slot_count = 0, .tuple_data_start = 5000, .live_count = 0, .dead_bytes = 0});
 	EXPECT_FALSE(View().CheckInvariants());
 }
 
