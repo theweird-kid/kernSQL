@@ -1,6 +1,11 @@
 #include "b_plus_tree_page.hpp"
 
 #include <cassert>
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+
+#include "common/types.hpp"
 
 using namespace kernsql;
 
@@ -36,11 +41,6 @@ uint16_t ConstLeafNode::LowerBound(index_key_t key) const {
 	return lo;
 }
 
-// Node-local checks only: count <= NODE_CAPACITY, level == 0, next_page_id is INVALID_PAGE or
-// a non-reserved page (which also catches a leaf nobody Init()ed), every RID valid, keys strictly
-// increasing.
-// Occupancy against the fanout, the separator bounds and the chain's order are tree-level and
-// live in BPlusTree::CheckInvariants.
 bool ConstLeafNode::CheckInvariants() const {
 	// One header read, so every check below judges the same snapshot.
 	const NodeSubHeader header = Header();
@@ -70,4 +70,64 @@ bool ConstLeafNode::CheckInvariants() const {
 		if (i > 0 && EntryAt(static_cast<uint16_t>(i - 1)).key >= entry.key) return false;
 	}
 	return true;
+}
+
+void LeafNode::Init() {
+	NodeSubHeader node_sh{0, 0, INVALID_PAGE};
+	node_sh.WriteTo(body_.first<NODE_SUB_HEADER_SIZE>());
+}
+
+void LeafNode::SetNextLeaf(page_id_t next) {
+	NodeSubHeader node_sh = Header();
+	node_sh.next_page_id = next;
+	node_sh.WriteTo(body_.first<NODE_SUB_HEADER_SIZE>());
+}
+
+void LeafNode::InsertAt(uint16_t index, const LeafEntry& entry) {
+	uint16_t N = Count();
+
+	assert(N < NODE_CAPACITY);
+	assert(index <= N);
+
+	std::memmove(body_.data() + NodeEntryOffset(index + 1), body_.data() + NodeEntryOffset(index),
+	             (N - index) * NODE_ENTRY_SIZE);
+	entry.WriteTo(body_.subspan(NodeEntryOffset(index)).first<NODE_ENTRY_SIZE>());
+
+	NodeSubHeader node_sh = Header();
+	node_sh.count++;
+	node_sh.WriteTo(body_.first<NODE_SUB_HEADER_SIZE>());
+}
+
+void LeafNode::RemoveAt(uint16_t index) {
+	uint16_t N = Count();
+
+	assert(N <= NODE_CAPACITY);
+	assert(index < N);
+
+	std::memmove(body_.data() + NodeEntryOffset(index), body_.data() + NodeEntryOffset(index + 1),
+	             (N - index - 1) * NODE_ENTRY_SIZE);
+	// The shift left a second copy of the last entry in slot N - 1. Zero it, so a node's bytes
+	// past count are always zero and two nodes holding the same entries stay byte-identical.
+	std::memset(body_.data() + NodeEntryOffset(static_cast<uint16_t>(N - 1)), 0, NODE_ENTRY_SIZE);
+
+	NodeSubHeader node_sh = Header();
+	node_sh.count--;
+	node_sh.WriteTo(body_.first<NODE_SUB_HEADER_SIZE>());
+}
+
+void LeafNode::Assign(std::span<const LeafEntry> entries) {
+	assert(entries.size() <= NODE_CAPACITY);
+	for (size_t it = 0; it < entries.size(); it++) {
+		entries[it].WriteTo(body_.subspan(NodeEntryOffset(it)).first<NODE_ENTRY_SIZE>());
+	}
+	// Zero every slot past the new count, up to capacity — not just up to the old count. The old
+	// count comes from the page and may be garbage (a page nobody Init()ed); capacity is a
+	// constant, so this never trusts the page to bound a write. The left half of every split
+	// shrinks through here.
+	const std::size_t tail = NodeEntryOffset(static_cast<uint16_t>(entries.size()));
+	std::memset(body_.data() + tail, 0, NodeEntryOffset(NODE_CAPACITY) - tail);
+
+	NodeSubHeader node_sh = Header();
+	node_sh.count = static_cast<uint16_t>(entries.size());
+	node_sh.WriteTo(body_.first<NODE_SUB_HEADER_SIZE>());
 }

@@ -299,12 +299,14 @@ class LeafNode {
 	// found `index` with LowerBound and already rejected a duplicate.
 	void InsertAt(uint16_t index, const LeafEntry& entry);
 
-	// Shift entry[index + 1 ..] left by one. Precondition, asserted: index < Count().
+	// Shift entry[index + 1 ..] left by one and zero the vacated last slot. Precondition, asserted:
+	// index < Count().
 	void RemoveAt(uint16_t index);
 
 	// Replace the node's whole contents with `entries`, which must already be sorted. Sets count
-	// to entries.size(). Precondition, asserted: entries.size() <= NODE_CAPACITY. The one
-	// primitive split, merge and redistribution are built from.
+	// to entries.size() and zeroes every slot past it, up to capacity. Precondition, asserted:
+	// entries.size() <= NODE_CAPACITY. The one primitive split, merge and redistribution are
+	// built from.
 	void Assign(std::span<const LeafEntry> entries);
 
   private:
