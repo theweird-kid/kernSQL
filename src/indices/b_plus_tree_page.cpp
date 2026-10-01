@@ -131,3 +131,78 @@ void LeafNode::Assign(std::span<const LeafEntry> entries) {
 	node_sh.count = static_cast<uint16_t>(entries.size());
 	node_sh.WriteTo(body_.first<NODE_SUB_HEADER_SIZE>());
 }
+
+NodeSubHeader ConstInternalNode::Header() const {
+	return NodeSubHeader::ReadFrom(body_.first<NODE_SUB_HEADER_SIZE>());
+}
+
+InternalEntry ConstInternalNode::EntryAt(uint16_t index) const {
+	assert(index < Count());
+	assert(index < NODE_CAPACITY);
+	return InternalEntry::ReadFrom(body_.subspan(NodeEntryOffset(index)).first<NODE_ENTRY_SIZE>());
+}
+
+index_key_t ConstInternalNode::KeyAt(uint16_t index) const {
+	uint16_t N = Count();
+
+	assert(1 <= index);
+	assert(index < N);
+
+	return EntryAt(index).key;
+}
+
+uint16_t ConstInternalNode::ChildIndexFor(index_key_t key) const {
+	uint16_t N = Count();
+	uint16_t low = 1;
+	uint16_t high = N;
+
+	while (low < high) {
+		uint16_t mid = low + (high - low) / 2;
+		if (KeyAt(mid) <= key) {
+			low = mid + 1;
+		} else {
+			high = mid;
+		}
+	}
+	return low - 1;
+}
+
+bool ConstInternalNode::CheckInvariants() const {
+	// One header read, so every check below judges the same snapshot.
+	const NodeSubHeader header = Header();
+
+	// FIRST, and returning rather than recording: same reason as the leaf — past this line the
+	// entry loop trusts count to bound its reads.
+	if (header.count > NODE_CAPACITY) return false;
+
+	// Level 0 is a leaf. This is also what catches a node nobody Init()ed: a zeroed sub-header
+	// reads level 0.
+	if (header.level < 1) return false;
+
+	// No B-link tree: the sibling field exists on internal nodes but is never used.
+	if (header.next_page_id != INVALID_PAGE) return false;
+
+	index_key_t prev = INT64_MIN;
+	for (uint16_t i = 0; i < header.count; ++i) {
+		const InternalEntry entry = EntryAt(i);
+
+		// A child must be a real data page. INVALID_PAGE is a hole Assign or InsertAt left behind;
+		// a reserved page (META, the catalog root) is a zeroed slot read as a child — 0 is
+		// META_PAGE_ID.
+		if (entry.child == INVALID_PAGE || entry.child <= CATALOG_ROOT_PAGE_ID) return false;
+
+		if (i == 0) {
+			// The unread slot has one canonical value, which Assign always writes.
+			if (entry.key != INT64_MIN) return false;
+			continue;
+		}
+
+		// STRICTLY increasing, starting at entry[1] compared against entry[0]'s INT64_MIN. That
+		// first comparison is deliberate: a separator equal to INT64_MIN would leave child 0 an
+		// empty key range, and the smallest key always stays in the leftmost leaf, so it can never
+		// legitimately be promoted.
+		if (entry.key <= prev) return false;
+		prev = entry.key;
+	}
+	return true;
+}

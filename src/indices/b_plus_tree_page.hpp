@@ -337,7 +337,7 @@ class ConstInternalNode {
 	[[nodiscard]] uint16_t ChildIndexFor(index_key_t key) const;
 
 	// Node-local checks: 1 <= level, count <= NODE_CAPACITY, entry[0].key == INT64_MIN, separators
-	// strictly increasing, no INVALID_PAGE child, next_page_id == INVALID_PAGE.
+	// strictly increasing, every child a non-reserved page, next_page_id == INVALID_PAGE.
 	[[nodiscard]] bool CheckInvariants() const;
 
   private:
