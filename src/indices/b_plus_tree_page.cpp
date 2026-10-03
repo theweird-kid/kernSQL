@@ -4,7 +4,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <expected>
 
+#include "common/status.hpp"
 #include "common/types.hpp"
 
 using namespace kernsql;
@@ -118,7 +120,8 @@ void LeafNode::RemoveAt(uint16_t index) {
 void LeafNode::Assign(std::span<const LeafEntry> entries) {
 	assert(entries.size() <= NODE_CAPACITY);
 	for (size_t it = 0; it < entries.size(); it++) {
-		entries[it].WriteTo(body_.subspan(NodeEntryOffset(it)).first<NODE_ENTRY_SIZE>());
+		const std::size_t offset = NodeEntryOffset(static_cast<uint16_t>(it));
+		entries[it].WriteTo(body_.subspan(offset).first<NODE_ENTRY_SIZE>());
 	}
 	// Zero every slot past the new count, up to capacity — not just up to the old count. The old
 	// count comes from the page and may be garbage (a page nobody Init()ed); capacity is a
@@ -157,7 +160,7 @@ uint16_t ConstInternalNode::ChildIndexFor(index_key_t key) const {
 	uint16_t high = N;
 
 	while (low < high) {
-		uint16_t mid = low + (high - low) / 2;
+		const auto mid = static_cast<uint16_t>(low + (high - low) / 2);
 		if (KeyAt(mid) <= key) {
 			low = mid + 1;
 		} else {
@@ -205,4 +208,141 @@ bool ConstInternalNode::CheckInvariants() const {
 		prev = entry.key;
 	}
 	return true;
+}
+
+void InternalNode::Init(uint16_t level) {
+	NodeSubHeader node_sh;
+
+	assert(level >= 1);
+	node_sh.level = level;
+
+	node_sh.count = 0;
+	node_sh.next_page_id = INVALID_PAGE;
+
+	node_sh.WriteTo(body_.first<NODE_SUB_HEADER_SIZE>());
+}
+
+void InternalNode::InsertAt(uint16_t index, const InternalEntry& entry) {
+	uint16_t N = Count();
+
+	assert(N < NODE_CAPACITY);
+	assert(1 <= index);
+	assert(index <= N);
+
+	std::memmove(body_.data() + NodeEntryOffset(index + 1), body_.data() + NodeEntryOffset(index),
+	             (N - index) * NODE_ENTRY_SIZE);
+	entry.WriteTo(body_.subspan(NodeEntryOffset(index)).first<NODE_ENTRY_SIZE>());
+
+	NodeSubHeader node_sh = Header();
+	node_sh.count++;
+	node_sh.WriteTo(body_.first<NODE_SUB_HEADER_SIZE>());
+}
+
+void InternalNode::RemoveAt(uint16_t index) {
+	uint16_t N = Count();
+
+	assert(N <= NODE_CAPACITY);
+	assert(1 <= index);
+	assert(index < N);
+
+	std::memmove(body_.data() + NodeEntryOffset(index), body_.data() + NodeEntryOffset(index + 1),
+	             (N - index - 1) * NODE_ENTRY_SIZE);
+	// The shift left a second copy of the last entry in slot N - 1. Zero it, so a node's bytes
+	// past count are always zero and two nodes holding the same entries stay byte-identical.
+	std::memset(body_.data() + NodeEntryOffset(static_cast<uint16_t>(N - 1)), 0, NODE_ENTRY_SIZE);
+
+	NodeSubHeader node_sh = Header();
+	node_sh.count--;
+	node_sh.WriteTo(body_.first<NODE_SUB_HEADER_SIZE>());
+}
+
+void InternalNode::SetKeyAt(uint16_t index, index_key_t key) {
+	uint16_t N = Count();
+
+	assert(1 <= index);
+	assert(index < N);
+
+	auto entry = EntryAt(index);
+	entry.key = key;
+	entry.WriteTo(body_.subspan(NodeEntryOffset(index)).first<NODE_ENTRY_SIZE>());
+}
+
+void InternalNode::Assign(std::span<const InternalEntry> entries) {
+	// At least one child, unlike a leaf: an internal node with no children has nowhere to send a
+	// search. One child is legal — a root holds one for a moment before it collapses.
+	assert(1 <= entries.size());
+	assert(entries.size() <= NODE_CAPACITY);
+
+	// entry[0] goes through a copy with its key canonicalized. A split's right half starts with
+	// the entry whose key was just pushed up to the parent; without this it would also linger in
+	// the unread slot, and CheckInvariants would reject the node far from the split that caused it.
+	InternalEntry first = entries[0];
+	first.key = INT64_MIN;
+	first.WriteTo(body_.subspan(NodeEntryOffset(0)).first<NODE_ENTRY_SIZE>());
+	for (size_t it = 1; it < entries.size(); it++) {
+		const std::size_t offset = NodeEntryOffset(static_cast<uint16_t>(it));
+		entries[it].WriteTo(body_.subspan(offset).first<NODE_ENTRY_SIZE>());
+	}
+	// Zero every slot past the new count, up to capacity — not just up to the old count. The old
+	// count comes from the page and may be garbage (a page nobody Init()ed); capacity is a
+	// constant, so this never trusts the page to bound a write. The left half of every split
+	// shrinks through here.
+	const std::size_t tail = NodeEntryOffset(static_cast<uint16_t>(entries.size()));
+	std::memset(body_.data() + tail, 0, NodeEntryOffset(NODE_CAPACITY) - tail);
+
+	NodeSubHeader node_sh = Header();
+	node_sh.count = static_cast<uint16_t>(entries.size());
+	node_sh.WriteTo(body_.first<NODE_SUB_HEADER_SIZE>());
+}
+
+Result<ConstLeafNode> kernsql::AsLeaf(const ReadPageGuard& guard) {
+	if (guard.Header().page_type != PageType::INDEX_LEAF) {
+		return std::unexpected(Status::Corruption("not a leaf page"));
+	}
+	return ConstLeafNode(guard.Body());
+}
+
+Result<LeafNode> kernsql::AsLeaf(WritePageGuard& guard) {
+	if (guard.Header().page_type != PageType::INDEX_LEAF) {
+		return std::unexpected(Status::Corruption("not a leaf page"));
+	}
+	return LeafNode(guard.MutableBody());
+}
+
+Result<ConstInternalNode> kernsql::AsInternal(const ReadPageGuard& guard) {
+	if (guard.Header().page_type != PageType::INDEX_INTERNAL) {
+		return std::unexpected(Status::Corruption("not an internal node page"));
+	}
+	return ConstInternalNode(guard.Body());
+}
+
+Result<InternalNode> kernsql::AsInternal(WritePageGuard& guard) {
+	if (guard.Header().page_type != PageType::INDEX_INTERNAL) {
+		return std::unexpected(Status::Corruption("not an internal node page"));
+	}
+	return InternalNode(guard.MutableBody());
+}
+
+Result<IndexHeader> kernsql::ReadIndexHeader(const ReadPageGuard& guard) {
+	if (guard.Header().page_type != PageType::INDEX_HEADER) {
+		return std::unexpected(Status::Corruption("not an index header page"));
+	}
+	return IndexHeader::ReadFrom(guard.Body());
+}
+
+Result<IndexHeader> kernsql::ReadIndexHeader(const WritePageGuard& guard) {
+	if (guard.Header().page_type != PageType::INDEX_HEADER) {
+		return std::unexpected(Status::Corruption("not an index header page"));
+	}
+	return IndexHeader::ReadFrom(guard.Body());
+}
+
+// Checks the type BEFORE writing: stamping an IndexHeader over a leaf or a heap page would
+// overwrite its first 12 bytes — the node sub-header and the start of entry[0].
+Status kernsql::WriteIndexHeader(WritePageGuard& guard, const IndexHeader& header) {
+	if (guard.Header().page_type != PageType::INDEX_HEADER) {
+		return Status::Corruption("not an index header page");
+	}
+	header.WriteTo(guard.MutableBody());
+	return Status::OK();
 }

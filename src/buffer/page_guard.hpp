@@ -40,12 +40,12 @@ class BufferPoolManager;
 // one named exception to DD-002's "never call into the replacer while holding a frame's
 // metadata mutex": publishing it afterwards let DeletePage vacate the frame in the gap and
 // revoke a membership that had not been created yet, leaving one frame on the free list and in
-// the replacer's candidate set at once. Step 1 precedes step 2 so a flusher holding the shared latch always observes
-// an epoch that already accounts for every write it is about to capture; step 1 precedes step 3
-// so a reclaimer that sees pin_count == 0 under the metadata mutex is guaranteed to see this
-// guard's dirty bump too, which is what makes its clean-check exact rather than merely
-// conservative. Between steps 2 and 3 the frame cannot be reclaimed: the pin is still held, and
-// it is the pin, not the latch, that protects a frame's identity.
+// the replacer's candidate set at once. Step 1 precedes step 2 so a flusher holding the shared
+// latch always observes an epoch that already accounts for every write it is about to capture;
+// step 1 precedes step 3 so a reclaimer that sees pin_count == 0 under the metadata mutex is
+// guaranteed to see this guard's dirty bump too, which is what makes its clean-check exact rather
+// than merely conservative. Between steps 2 and 3 the frame cannot be reclaimed: the pin is still
+// held, and it is the pin, not the latch, that protects a frame's identity.
 
 class ReadPageGuard {
   public:
