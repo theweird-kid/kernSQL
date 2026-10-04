@@ -7,8 +7,8 @@
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
-#include <utility>
 #include <optional>
+#include <utility>
 #include <vector>
 
 #include "buffer/buffer_pool_manager.hpp"
@@ -478,7 +478,13 @@ TEST_F(BPlusTreePageTest, InternalNeverInitedFailsCheckInvariants) {
 
 // entries[0].key = 42 goes in; EntryAt(0).key reads INT64_MIN and CheckInvariants passes.
 TEST_F(BPlusTreePageTest, InternalAssignWritesInt64MinIntoEntryZero) {
-	GTEST_SKIP() << "not written yet";
+	auto internal_node = Internal();
+	internal_node.Init(1);
+	std::vector<InternalEntry> entries{InternalEntry{42, 3, 0}, InternalEntry{43, 6, 0}};
+	internal_node.Assign(entries);
+
+	auto entry = internal_node.EntryAt(0);
+	ASSERT_EQ(entry.key, INT64_MIN);
 }
 
 // The caller's span is not modified by the canonicalization.
@@ -631,30 +637,79 @@ TEST_F(BPlusTreePageTest, InternalSetKeyAtChangesOnlyThatKey) {
 // ---------------------------------------------------------------------------------------------
 
 TEST_F(BPlusTreePageTest, ChildIndexForBelowFirstSeparatorIsZero) {
-	GTEST_SKIP() << "not written yet";
+	auto internal_node = Internal();
+	internal_node.Init(1);
+	internal_node.Assign(InternalEntries(4));
+
+	ASSERT_EQ(internal_node.ChildIndexFor(9), 0);
+	ASSERT_EQ(internal_node.ChildIndexFor(3), 0);
+	ASSERT_EQ(internal_node.ChildIndexFor(0), 0);
+	ASSERT_EQ(internal_node.ChildIndexFor(INT64_MIN), 0);
 }
 
 // key == KeyAt(i) goes to child i, not i - 1: separators bound their child from below.
 TEST_F(BPlusTreePageTest, ChildIndexForEqualToSeparator) {
-	GTEST_SKIP() << "not written yet";
+	auto internal_node = Internal();
+	internal_node.Init(1);
+	internal_node.Assign(InternalEntries(4));
+
+	ASSERT_EQ(internal_node.ChildIndexFor(10), 1);
 }
 
 TEST_F(BPlusTreePageTest, ChildIndexForBetweenSeparators) {
-	GTEST_SKIP() << "not written yet";
+	auto internal_node = Internal();
+	internal_node.Init(1);
+	internal_node.Assign(InternalEntries(4));
+
+	ASSERT_EQ(internal_node.ChildIndexFor(15), 1);
+	ASSERT_EQ(internal_node.ChildIndexFor(25), 2);
+
+	ASSERT_EQ(internal_node.ChildIndexFor(11), 1);
+	ASSERT_EQ(internal_node.ChildIndexFor(19), 1);
 }
 
 TEST_F(BPlusTreePageTest, ChildIndexForAboveLastSeparatorIsLastChild) {
-	GTEST_SKIP() << "not written yet";
+	auto node = Internal();
+	node.Init(1);
+	node.Assign(InternalEntries(4));  // separators 10, 20, 30
+
+	// Count() - 1, never Count(): one past the last child is not a child.
+	EXPECT_EQ(node.ChildIndexFor(31), 3);
+	EXPECT_EQ(node.ChildIndexFor(1000), 3);
+	EXPECT_EQ(node.ChildIndexFor(INT64_MAX), 3);
 }
 
 // No separators at all: every key, including INT64_MIN and INT64_MAX, goes to child 0.
 TEST_F(BPlusTreePageTest, ChildIndexForSingleChildIsAlwaysZero) {
-	GTEST_SKIP() << "not written yet";
+	auto internal_node = Internal();
+	internal_node.Init(1);
+	internal_node.Assign(InternalEntries(1));
+
+	ASSERT_EQ(internal_node.ChildIndexFor(INT64_MIN), 0);
+	ASSERT_EQ(internal_node.ChildIndexFor(INT64_MAX), 0);
 }
 
 // Full node: for every separator and every gap, against a linear scan.
 TEST_F(BPlusTreePageTest, ChildIndexForMatchesALinearScanOnAFullNode) {
-	GTEST_SKIP() << "not written yet";
+	auto node = Internal();
+	node.Init(1);
+	const auto entries = InternalEntries(NODE_CAPACITY);  // separators 10, 20, ..., 2520
+	node.Assign(entries);
+
+	// Every separator and every gap, a little past both ends, plus the extremes.
+	std::vector<index_key_t> probes{INT64_MIN, INT64_MAX};
+	for (index_key_t k = -5; k <= 10 * NODE_CAPACITY; ++k) probes.push_back(k);
+
+	for (const index_key_t probe : probes) {
+		// The header's definition, written as a plain scan: the largest i in [1, Count()) with
+		// KeyAt(i) <= probe, or 0 if there is none. Reads `entries`, not the node, so a bug in
+		// KeyAt cannot hide in both sides of the comparison.
+		uint16_t expected = 0;
+		for (uint16_t i = 1; i < entries.size(); ++i) {
+			if (entries[i].key <= probe) expected = i;
+		}
+		ASSERT_EQ(node.ChildIndexFor(probe), expected) << "probe " << probe;
+	}
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -802,8 +857,9 @@ TEST_F(BPlusTreePageTest, AsLeafAcceptsALeafPage) {
 			EXPECT_EQ(leaf->EntryAt(0), entry);
 
 			// The view's span is the guard's body itself, not an offset into it.
-			EXPECT_EQ(LeafEntry::ReadFrom(guard->Body().subspan<NodeEntryOffset(0), NODE_ENTRY_SIZE>()),
-			          entry);
+			EXPECT_EQ(
+			    LeafEntry::ReadFrom(guard->Body().subspan<NodeEntryOffset(0), NODE_ENTRY_SIZE>()),
+			    entry);
 		}
 	});
 }
@@ -905,7 +961,56 @@ TEST_F(BPlusTreePageTest, WriteIndexHeaderRejectsANonHeaderPageWithoutWriting) {
 
 // Write, Shutdown, reopen, read back: survives a trip through disk, not just the frame.
 TEST_F(BPlusTreePageTest, IndexHeaderSurvivesFlushAndReopen) {
-	GTEST_SKIP() << "not written yet";
+	// By hand rather than WithBufferPool: the file has to be closed and opened again mid-test.
+	const auto path = std::filesystem::temp_directory_path() / "kernsql_bptree_header_reopen_test";
+	std::filesystem::remove(path);
+
+	// Every field off its default and distinct from the others, so neither an unwritten field nor
+	// a swapped pair can pass.
+	const IndexHeader written{7, 3, 4, 5};
+	page_id_t page_id{};
+	{
+		auto dm = DiskManager::Open(path);
+		ASSERT_TRUE(dm.has_value()) << dm.error().message();
+		{
+			BufferPoolManager bpm(**dm, 4);
+			{
+				auto guard = bpm.NewPage();
+				ASSERT_TRUE(guard.has_value()) << guard.error().message();
+				page_id = guard->PageId();
+				guard->SetPageType(PageType::INDEX_HEADER);
+				const Status status = WriteIndexHeader(*guard, written);
+				ASSERT_TRUE(status.ok()) << status.message();
+			}
+			// The durability step: flush, then sync. The destructor is only a backstop.
+			ASSERT_TRUE(bpm.Shutdown().ok());
+		}
+		dm->reset();
+	}
+	{
+		// A fresh DiskManager and pool hold nothing cached, so this fetch is a real disk read
+		// through the miss-path validation — not the frame the write went into.
+		auto dm = DiskManager::Open(path);
+		ASSERT_TRUE(dm.has_value()) << dm.error().message();
+		{
+			BufferPoolManager bpm(**dm, 4);
+			{
+				auto guard = bpm.FetchPageRead(page_id);
+				ASSERT_TRUE(guard.has_value()) << guard.error().message();
+				EXPECT_EQ(guard->Header().page_type, PageType::INDEX_HEADER);
+
+				auto read = ReadIndexHeader(*guard);
+				ASSERT_TRUE(read.has_value()) << read.error().message();
+				EXPECT_EQ(read->root_page_id, written.root_page_id);
+				EXPECT_EQ(read->height, written.height);
+				EXPECT_EQ(read->leaf_max, written.leaf_max);
+				EXPECT_EQ(read->internal_max, written.internal_max);
+			}
+			EXPECT_TRUE(bpm.Shutdown().ok());
+		}
+		dm->reset();
+	}
+	std::filesystem::remove(path);
 }
 
 }  // namespace kernsql
