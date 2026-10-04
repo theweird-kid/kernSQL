@@ -167,6 +167,9 @@ struct LeafEntry {
 	index_key_t key{0};
 	RID rid{};
 
+	// Field by field, so padding never takes part — the same reason WriteTo goes field by field.
+	bool operator==(const LeafEntry&) const = default;
+
 	static LeafEntry ReadFrom(std::span<const std::byte, NODE_ENTRY_SIZE> bytes) {
 		LeafEntry s;
 		std::memcpy(&s, bytes.data(), sizeof(LeafEntry));
@@ -192,6 +195,8 @@ struct InternalEntry {
 	index_key_t key{0};
 	page_id_t child{INVALID_PAGE};
 	uint32_t reserved{0};
+
+	bool operator==(const InternalEntry&) const = default;
 
 	static InternalEntry ReadFrom(std::span<const std::byte, NODE_ENTRY_SIZE> bytes) {
 		InternalEntry s;
