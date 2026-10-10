@@ -1,5 +1,8 @@
 #include "b_plus_tree.hpp"
 
+#include <cstdint>
+#include <expected>
+
 #include "common/status.hpp"
 #include "common/types.hpp"
 #include "indices/b_plus_tree_page.hpp"
@@ -70,3 +73,54 @@ Result<std::unique_ptr<BPlusTree>> BPlusTree::Open(BufferPoolManager& bpm,
 	return std::unique_ptr<BPlusTree>(
 	    new BPlusTree(bpm, header_page_id, idx_header->leaf_max, idx_header->internal_max));
 }
+
+Result<RID> BPlusTree::Get(index_key_t key) {
+	page_id_t root_page_id{INVALID_PAGE};
+	uint16_t tree_height{0};
+	{  // Get root page from index header
+		auto idx_header_page = bpm_.FetchPageRead(header_page_id_);
+		if (!idx_header_page.has_value()) return std::unexpected(idx_header_page.error());
+
+		auto idx_header = ReadIndexHeader(idx_header_page.value());
+		if (!idx_header.has_value()) return std::unexpected(idx_header.error());
+
+		root_page_id = idx_header->root_page_id;
+		tree_height = idx_header->height;
+	}  // Release
+
+	page_id_t next_page_id = root_page_id;
+	for (uint16_t height = 0; height < tree_height; height++) {
+		auto read_page = bpm_.FetchPageRead(next_page_id);
+		if (!read_page.has_value()) return std::unexpected(read_page.error());
+
+		if (height == tree_height - 1) {  // LEAF
+			auto leaf = AsLeaf(read_page.value());
+			if (!leaf.has_value()) return std::unexpected(leaf.error());
+
+			auto idx = leaf.value().LowerBound(key);
+			if (idx == leaf->Count() || leaf->KeyAt(idx) != key)  // NOT FOUND
+				return std::unexpected(Status::NotFound("key not in index"));
+
+			return leaf->EntryAt(idx).rid;  // FOUND
+
+		} else {  // INTERNAL
+			auto internal = AsInternal(read_page.value());
+			if (!internal.has_value()) return std::unexpected(internal.error());
+
+			auto idx = internal->ChildIndexFor(key);
+			next_page_id = internal->ChildAt(idx);
+		}
+	}
+
+	return std::unexpected(Status::Corruption("index header height is zero"));
+}
+
+/*
+ * Forward scan over the closed interval [lo, hi]. Integer keys make every comparison predicate
+ * a closed interval — `pk < 5` is [INT64_MIN, 4] — so this is the only range shape needed; the
+ * executor does that translation, including the predicates that are empty at the ends of the
+ * domain. An empty interval (lo > hi) yields an iterator whose first Next() returns false.
+ *
+ * Can fail, unlike TableHeap::Scan, because positioning descends the tree.
+ */
+Result<IndexIterator> BPlusTree::Scan(index_key_t lo, index_key_t hi) {}
