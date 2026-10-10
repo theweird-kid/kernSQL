@@ -208,6 +208,15 @@ class BPlusTree {
 	      leaf_max_(leaf_max),
 	      internal_max_(internal_max) {}
 
+	/*
+	 * The read-path descent shared by Get and Scan: read the root and height from the header, drop
+	 * the header guard, then go down one read guard at a time to the leaf that would hold `key`.
+	 *
+	 * Returns the leaf's guard WITHOUT validating it as a leaf — each caller does its own AsLeaf,
+	 * which is also where a header height too large for the real tree is caught.
+	 */
+	[[nodiscard]] Result<ReadPageGuard> FindLeafRead(index_key_t key);
+
 	BufferPoolManager& bpm_;
 	const page_id_t header_page_id_;
 

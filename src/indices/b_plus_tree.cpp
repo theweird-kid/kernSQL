@@ -74,7 +74,7 @@ Result<std::unique_ptr<BPlusTree>> BPlusTree::Open(BufferPoolManager& bpm,
 	    new BPlusTree(bpm, header_page_id, idx_header->leaf_max, idx_header->internal_max));
 }
 
-Result<RID> BPlusTree::Get(index_key_t key) {
+Result<ReadPageGuard> BPlusTree::FindLeafRead(index_key_t key) {
 	page_id_t root_page_id{INVALID_PAGE};
 	uint16_t tree_height{0};
 	{  // Get root page from index header
@@ -88,39 +88,126 @@ Result<RID> BPlusTree::Get(index_key_t key) {
 		tree_height = idx_header->height;
 	}  // Release
 
+	if (tree_height == 0) return std::unexpected(Status::Corruption("index header height is zero"));
+
+	// Every level above the leaf. A height too large or too small for the real tree surfaces as
+	// a type mismatch: AsInternal here, or the caller's AsLeaf on what comes back.
 	page_id_t next_page_id = root_page_id;
-	for (uint16_t height = 0; height < tree_height; height++) {
+	for (uint16_t height = 0; height + 1 < tree_height; height++) {
 		auto read_page = bpm_.FetchPageRead(next_page_id);
 		if (!read_page.has_value()) return std::unexpected(read_page.error());
 
-		if (height == tree_height - 1) {  // LEAF
-			auto leaf = AsLeaf(read_page.value());
-			if (!leaf.has_value()) return std::unexpected(leaf.error());
+		auto internal = AsInternal(read_page.value());
+		if (!internal.has_value()) return std::unexpected(internal.error());
 
-			auto idx = leaf.value().LowerBound(key);
-			if (idx == leaf->Count() || leaf->KeyAt(idx) != key)  // NOT FOUND
-				return std::unexpected(Status::NotFound("key not in index"));
-
-			return leaf->EntryAt(idx).rid;  // FOUND
-
-		} else {  // INTERNAL
-			auto internal = AsInternal(read_page.value());
-			if (!internal.has_value()) return std::unexpected(internal.error());
-
-			auto idx = internal->ChildIndexFor(key);
-			next_page_id = internal->ChildAt(idx);
-		}
+		next_page_id = internal->ChildAt(internal->ChildIndexFor(key));
 	}
 
-	return std::unexpected(Status::Corruption("index header height is zero"));
+	return bpm_.FetchPageRead(next_page_id);  // LEAF
 }
 
-/*
- * Forward scan over the closed interval [lo, hi]. Integer keys make every comparison predicate
- * a closed interval — `pk < 5` is [INT64_MIN, 4] — so this is the only range shape needed; the
- * executor does that translation, including the predicates that are empty at the ends of the
- * domain. An empty interval (lo > hi) yields an iterator whose first Next() returns false.
- *
- * Can fail, unlike TableHeap::Scan, because positioning descends the tree.
- */
-Result<IndexIterator> BPlusTree::Scan(index_key_t lo, index_key_t hi) {}
+Result<RID> BPlusTree::Get(index_key_t key) {
+	auto leaf_page = FindLeafRead(key);
+	if (!leaf_page.has_value()) return std::unexpected(leaf_page.error());
+
+	auto leaf = AsLeaf(leaf_page.value());
+	if (!leaf.has_value()) return std::unexpected(leaf.error());
+
+	auto idx = leaf->LowerBound(key);
+	if (idx == leaf->Count() || leaf->KeyAt(idx) != key)  // NOT FOUND
+		return std::unexpected(Status::NotFound("key not in index"));
+
+	return leaf->EntryAt(idx).rid;  // FOUND
+}
+
+Result<IndexIterator> BPlusTree::Scan(index_key_t lo, index_key_t hi) {
+	auto leaf_page = FindLeafRead(lo);
+	if (!leaf_page.has_value()) return std::unexpected(leaf_page.error());
+
+	auto leaf = AsLeaf(leaf_page.value());
+	if (!leaf.has_value()) return std::unexpected(leaf.error());
+
+	// No equality check: lo need not be present, and idx may equal Count() — Next() handles both.
+	// The guard drops on return; the iterator re-fetches the leaf on its first Next().
+	return IndexIterator(bpm_, leaf_page->PageId(), leaf->LowerBound(lo), hi);
+}
+
+IndexIterator::~IndexIterator() = default;
+
+IndexIterator::IndexIterator(IndexIterator&& other) noexcept
+    : bpm_(other.bpm_),
+      guard_(std::move(other.guard_)),
+      page_id_(other.page_id_),
+      index_(other.index_),
+      hi_(other.hi_),
+      current_(other.current_) {
+	other.guard_.reset();
+	other.page_id_ = INVALID_PAGE;
+}
+
+IndexIterator& IndexIterator::operator=(IndexIterator&& other) noexcept {
+	if (this == &other) return *this;
+
+	// release current guard
+	this->guard_.reset();
+
+	// move state from other
+	this->bpm_ = other.bpm_;
+	this->guard_ = std::move(other.guard_);
+	this->page_id_ = other.page_id_;
+	this->index_ = other.index_;
+	this->hi_ = other.hi_;
+	this->current_ = other.current_;
+
+	// exhaust other
+	other.guard_.reset();
+	other.page_id_ = INVALID_PAGE;
+
+	return *this;
+}
+
+Result<bool> IndexIterator::Next() {
+	// Loops only to step over leaves with nothing left to report: Scan's one-past-the-end
+	// position, an empty root leaf, or the end of each leaf as the scan crosses it.
+	while (page_id_ != INVALID_PAGE) {
+		// Fetch only on arriving at a leaf; every other call reuses the guard kept from the last.
+		if (!guard_) {
+			auto read_page = bpm_->FetchPageRead(page_id_);
+			if (!read_page.has_value()) {
+				page_id_ = INVALID_PAGE;
+				return std::unexpected(read_page.error());
+			}
+			guard_.emplace(std::move(read_page.value()));
+		}
+
+		auto leaf = AsLeaf(*guard_);
+		if (!leaf.has_value()) {
+			guard_.reset();
+			page_id_ = INVALID_PAGE;
+			return std::unexpected(leaf.error());
+		}
+
+		// Past this leaf's last entry: not a result. Read the link BEFORE dropping the guard —
+		// the view points into the frame, and the frame is not ours once the pin is gone.
+		if (index_ >= leaf->Count()) {
+			const page_id_t next = leaf->NextLeaf();
+			guard_.reset();
+			page_id_ = next;
+			index_ = 0;
+			continue;
+		}
+
+		const LeafEntry entry = leaf->EntryAt(index_);
+		if (entry.key > hi_) {  // Past the interval: done, and hold nothing.
+			guard_.reset();
+			page_id_ = INVALID_PAGE;
+			return false;
+		}
+
+		current_ = entry;
+		index_++;
+		return true;  // Still holding the leaf's guard, for the next call.
+	}
+
+	return false;
+}
