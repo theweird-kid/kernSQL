@@ -134,6 +134,8 @@ class BPlusTree {
 	BPlusTree(BPlusTree&&) = delete;
 	BPlusTree& operator=(BPlusTree&&) = delete;
 
+	static bool FanoutInRange(uint16_t max) { return max >= MIN_FANOUT && max <= NODE_CAPACITY; }
+
 	/*
 	 * Insert `key -> rid`. kDuplicateKey if the key is present, reported before anything is
 	 * modified.
