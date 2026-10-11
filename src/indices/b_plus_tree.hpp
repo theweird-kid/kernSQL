@@ -3,6 +3,9 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <set>
+#include <utility>
+#include <vector>
 
 #include "buffer/buffer_pool_manager.hpp"
 #include "buffer/page_guard.hpp"
@@ -216,6 +219,33 @@ class BPlusTree {
 	 * which is also where a header height too large for the real tree is caught.
 	 */
 	[[nodiscard]] Result<ReadPageGuard> FindLeafRead(index_key_t key);
+
+	/*
+	 * CheckInvariants' recursive walk: check the subtree rooted at `page_id`, then each child's
+	 * subtree, left to right. False on the first violation, logged with the page it was found on.
+	 *
+	 * Checks, for this node: not seen before (recorded BEFORE the fetch, so a cycle of child
+	 * pointers fails instead of recursing forever); page type and stored level both match
+	 * `expected_level` (0 = leaf); the node's own CheckInvariants; occupancy against the cached
+	 * fanout — the root exempt from the floor, an internal root needing 2 children; and every key
+	 * inside [lo, hi). For an internal node the separators are held to the same interval, and child
+	 * i is checked against [separator i, separator i + 1), child 0 inheriting this node's `lo` and
+	 * the last child its `hi`.
+	 *
+	 * `hi` is exclusive, so std::nullopt is "no upper bound" — INT64_MAX is a legal key and cannot
+	 * stand in for it. `lo` is inclusive, so INT64_MIN needs no such case.
+	 *
+	 * Copies out what it needs and drops the node's guard BEFORE recursing: one pin at a time, as
+	 * on the read path, never one per level.
+	 *
+	 * `leaves` collects (leaf page id, its NextLeaf()) in walk order, which is key order. The leaf
+	 * chain is checked against it by the caller once the walk is done — without a re-fetch, and
+	 * without a chain walk that a cycle could hang.
+	 */
+	[[nodiscard]] bool CheckSubtree(page_id_t page_id, uint16_t expected_level, index_key_t lo,
+	                                std::optional<index_key_t> hi, bool is_root,
+	                                std::set<page_id_t>& seen_pages,
+	                                std::vector<std::pair<page_id_t, page_id_t>>& leaves);
 
 	BufferPoolManager& bpm_;
 	const page_id_t header_page_id_;

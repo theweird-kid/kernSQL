@@ -2,7 +2,12 @@
 
 #include <cstdint>
 #include <expected>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <vector>
 
+#include "common/logger.hpp"
 #include "common/status.hpp"
 #include "common/types.hpp"
 #include "indices/b_plus_tree_page.hpp"
@@ -210,4 +215,200 @@ Result<bool> IndexIterator::Next() {
 	}
 
 	return false;
+}
+
+/*
+ * The whole-tree check (DD-005, "Invariants"): page types, levels, key order, SEPARATOR BOUNDS
+ * carried down the recursion as a [lo, hi) interval, occupancy against the fanout, the leaf
+ * chain matching the recursive walk, and no page reached twice.
+ *
+ * O(n). For tests, after every operation — never on a production path. Public so a test can
+ * check a tree it drove through the public API alone.
+ */
+bool BPlusTree::CheckInvariants() {
+	page_id_t root_page_id{INVALID_PAGE};
+	uint16_t tree_height{0};
+	{
+		auto header_page_guard = bpm_.FetchPageRead(header_page_id_);
+		if (!header_page_guard.has_value()) {
+			LOG_DEBUG("unable to get index header page guard");
+			return false;
+		}
+
+		auto index_header = ReadIndexHeader(header_page_guard.value());
+		if (!index_header.has_value()) {
+			const std::string_view message = index_header.error().message();
+			LOG_DEBUG("unable to read index header: %.*s", static_cast<int>(message.size()),
+			          message.data());
+			return false;
+		}
+
+		root_page_id = index_header->root_page_id;
+		tree_height = index_header->height;
+
+		if (tree_height < 1) {
+			LOG_DEBUG("incorrect tree height, got: %d", tree_height);
+			return false;
+		}
+
+		if (index_header->leaf_max != leaf_max_) {
+			LOG_DEBUG("incorrect leaf_max, expected: %d, got: %d", leaf_max_,
+			          index_header->leaf_max);
+			return false;
+		}
+		if (index_header->internal_max != internal_max_) {
+			LOG_DEBUG("incorrect internal_max, expected: %d, got: %d", internal_max_,
+			          index_header->internal_max);
+			return false;
+		}
+	}
+
+	// The header counts as seen, so a child pointer back at it fails the walk.
+	std::set<page_id_t> seen_pages;
+	seen_pages.insert(header_page_id_);
+
+	std::vector<std::pair<page_id_t, page_id_t>> leaves;
+
+	// height counts levels, the root's level is height - 1: a height-1 tree's root is a leaf.
+	if (!CheckSubtree(root_page_id, static_cast<uint16_t>(tree_height - 1), INT64_MIN,
+	                  std::nullopt, true, seen_pages, leaves)) {
+		return false;
+	}
+
+	// The leaf chain against the walk: each leaf's NextLeaf() is the leaf the walk reached after
+	// it, and the last one points nowhere. Compared against a list of known length, so a cycle in
+	// the chain fails here instead of hanging a chain walk.
+	for (std::size_t i = 0; i < leaves.size(); i++) {
+		const page_id_t expected_next =
+		    i + 1 < leaves.size() ? leaves[i + 1].first : INVALID_PAGE;
+		if (leaves[i].second != expected_next) {
+			LOG_DEBUG("leaf chain broken at leaf %zu (page %d): NextLeaf is %d, expected %d", i,
+			          leaves[i].first, leaves[i].second, expected_next);
+			return false;
+		}
+	}
+	return true;
+}
+
+bool BPlusTree::CheckSubtree(page_id_t page_id, uint16_t expected_level, index_key_t lo,
+                             std::optional<index_key_t> hi, bool is_root,
+                             std::set<page_id_t>& seen_pages,
+                             std::vector<std::pair<page_id_t, page_id_t>>& leaves) {
+	if (seen_pages.contains(page_id)) {
+		LOG_DEBUG("page_id: %d, expected_level: %d, error: %d already in seen set", page_id,
+		          expected_level, page_id);
+		return false;
+	}
+	seen_pages.insert(page_id);
+
+	auto read_guard = bpm_.FetchPageRead(page_id);
+	if (!read_guard.has_value()) {
+		LOG_DEBUG("page_id: %d, expected_level: %d, error: unable to fetch read_guard for page %d",
+		          page_id, expected_level, page_id);
+		return false;
+	}
+	if (expected_level > 0) {  // INTERNAL
+		// Copied out under the guard, which is dropped before recursing: one pin at a time.
+		std::vector<InternalEntry> entries;
+		{
+			auto internal_node = AsInternal(read_guard.value());
+			if (!internal_node.has_value()) {
+				const std::string_view message = internal_node.error().message();
+				LOG_DEBUG("page_id: %d, expected_level: %d, error: %.*s", page_id, expected_level,
+				          static_cast<int>(message.size()), message.data());
+				return false;
+			}
+
+			// FIRST, and returning: past this line the loop trusts Count() to bound its reads,
+			// which only the node's own check guarantees.
+			if (!internal_node->CheckInvariants()) {
+				LOG_DEBUG("page_id: %d, expected_level: %d, error: node-local invariants failed",
+				          page_id, expected_level);
+				return false;
+			}
+
+			if (internal_node->Level() != expected_level) {
+				LOG_DEBUG("page_id: %d, expected_level: %d, error: stored level is %d", page_id,
+				          expected_level, internal_node->Level());
+				return false;
+			}
+
+			const uint16_t count = internal_node->Count();
+			const uint16_t min_children = is_root ? 2 : InternalMinChildren(internal_max_);
+			if (count < min_children || count > internal_max_) {
+				LOG_DEBUG("page_id: %d, expected_level: %d, error: %d children, outside [%d, %d]",
+				          page_id, expected_level, count, min_children, internal_max_);
+				return false;
+			}
+
+			entries.reserve(count);
+			for (uint16_t i = 0; i < count; i++) entries.push_back(internal_node->EntryAt(i));
+		}
+		read_guard->Drop();
+
+		// Separators are held to this node's interval too, not just ordered among themselves.
+		// entry[0].key is the unread INT64_MIN slot, not a separator.
+		for (std::size_t i = 1; i < entries.size(); i++) {
+			const index_key_t key = entries[i].key;
+			if (key < lo || (hi.has_value() && key >= *hi)) {
+				LOG_DEBUG("page_id: %d, expected_level: %d, error: separator %lld outside [lo, hi)",
+				          page_id, expected_level, static_cast<long long>(key));
+				return false;
+			}
+		}
+
+		// Child i covers [separator i, separator i + 1). The two ends have no separator of their
+		// own and inherit this node's bounds: child 0 gets lo — NOT entry[0]'s INT64_MIN — and the
+		// last child gets hi.
+		const auto child_level = static_cast<uint16_t>(expected_level - 1);
+		for (std::size_t i = 0; i < entries.size(); i++) {
+			const index_key_t child_lo = i == 0 ? lo : entries[i].key;
+			const std::optional<index_key_t> child_hi =
+			    i + 1 < entries.size() ? std::optional<index_key_t>(entries[i + 1].key) : hi;
+			if (!CheckSubtree(entries[i].child, child_level, child_lo, child_hi, false, seen_pages,
+			                  leaves)) {
+				return false;
+			}
+		}
+		return true;
+
+	} else {  // LEAF
+		auto leaf_node = AsLeaf(read_guard.value());
+		if (!leaf_node.has_value()) {
+			const std::string_view message = leaf_node.error().message();
+			LOG_DEBUG("page_id: %d, expected_level: %d, error: %.*s", page_id, expected_level,
+			          static_cast<int>(message.size()), message.data());
+			return false;
+		}
+
+		if (!leaf_node->CheckInvariants()) {
+			LOG_DEBUG("page_id: %d, expected_level: %d, error: node-local invariants failed",
+			          page_id, expected_level);
+			return false;
+		}
+
+		const uint16_t count = leaf_node->Count();
+		// Level 0 is already part of the node's own check. A root leaf may be empty.
+		const uint16_t min_entries = is_root ? 0 : LeafMinEntries(leaf_max_);
+		if (count < min_entries || count > leaf_max_) {
+			LOG_DEBUG("page_id: %d, expected_level: %d, error: %d entries, outside [%d, %d]",
+			          page_id, expected_level, count, min_entries, leaf_max_);
+			return false;
+		}
+
+		for (uint16_t i = 0; i < count; i++) {
+			const index_key_t key = leaf_node->KeyAt(i);
+			if (key < lo || (hi.has_value() && key >= *hi)) {
+				// hi may be "no upper bound"; never .value() it unchecked, or the report crashes.
+				LOG_DEBUG("page_id: %d, expected_level: %d, error: key %lld outside [%lld, %s)",
+				          page_id, expected_level, static_cast<long long>(key),
+				          static_cast<long long>(lo),
+				          hi.has_value() ? std::to_string(*hi).c_str() : "+inf");
+				return false;
+			}
+		}
+
+		leaves.push_back({page_id, leaf_node->NextLeaf()});
+		return true;
+	}
 }
