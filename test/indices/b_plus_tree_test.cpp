@@ -230,7 +230,24 @@ TEST_F(BPlusTreeTest, CreateRejectsFanoutOutOfRange) {
 
 // MIN_FANOUT and NODE_CAPACITY themselves are accepted — the range is closed at both ends.
 TEST_F(BPlusTreeTest, CreateAcceptsFanoutAtBothBounds) {
-	GTEST_SKIP() << "TODO";
+	struct Case {
+		uint16_t leaf_max;
+		uint16_t internal_max;
+	};
+	const Case cases[] = {
+	    {MIN_FANOUT, MIN_FANOUT},
+	    {NODE_CAPACITY, NODE_CAPACITY},
+	    {MIN_FANOUT, NODE_CAPACITY},
+	    {NODE_CAPACITY, MIN_FANOUT},
+	};
+	for (const Case& c : cases) {
+		SCOPED_TRACE(testing::Message()
+		             << "leaf_max=" << c.leaf_max << " internal_max=" << c.internal_max);
+		auto tree = BPlusTree::Create(*bpm_, c.leaf_max, c.internal_max);
+		ASSERT_TRUE(tree.has_value()) << tree.error().message();
+		EXPECT_EQ(tree.value()->LeafMax(), c.leaf_max);
+		EXPECT_EQ(tree.value()->InternalMax(), c.internal_max);
+	}
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -240,22 +257,76 @@ TEST_F(BPlusTreeTest, CreateAcceptsFanoutAtBothBounds) {
 // Create at a non-default fanout, Reopen(), and LeafMax()/InternalMax() come back unchanged, as
 // does HeaderPageId().
 TEST_F(BPlusTreeTest, OpenReadsTheFanoutBackAfterAReopen) {
-	GTEST_SKIP() << "TODO";
+	// Different from kFanout and from each other, so a swapped pair or a fanout that fell back
+	// to the fixture's is caught.
+	constexpr uint16_t kLeafMax = 5;
+	constexpr uint16_t kInternalMax = 7;
+
+	auto created = BPlusTree::Create(*bpm_, kLeafMax, kInternalMax);
+	ASSERT_TRUE(created.has_value()) << created.error().message();
+	tree_ = std::move(created.value());
+	const page_id_t header = tree_->HeaderPageId();
+
+	Reopen();
+
+	EXPECT_EQ(tree_->HeaderPageId(), header);
+	EXPECT_EQ(tree_->LeafMax(), kLeafMax);
+	EXPECT_EQ(tree_->InternalMax(), kInternalMax);
 }
 
 // Open on a page that is not INDEX_HEADER (the root leaf, a heap page) is kCorruption.
 TEST_F(BPlusTreeTest, OpenRejectsAPageThatIsNotAnIndexHeader) {
-	GTEST_SKIP() << "TODO";
+	page_id_t root{INVALID_PAGE};
+	{
+		auto guard = bpm_->FetchPageRead(tree_->HeaderPageId());
+		ASSERT_TRUE(guard.has_value()) << guard.error().message();
+		root = IndexHeader::ReadFrom(guard->Body()).root_page_id;
+	}
+	page_id_t heap{INVALID_PAGE};
+	{
+		auto guard = bpm_->NewPage();
+		ASSERT_TRUE(guard.has_value()) << guard.error().message();
+		guard->SetPageType(PageType::HEAP);
+		heap = guard->PageId();
+	}
+
+	for (const page_id_t id : {root, heap}) {
+		SCOPED_TRACE(testing::Message() << "page " << id);
+		auto opened = BPlusTree::Open(*bpm_, id);
+		ASSERT_FALSE(opened.has_value());
+		EXPECT_EQ(opened.error().code(), ErrorCode::kCorruption);
+	}
 }
 
 // StampHeader a leaf_max outside [MIN_FANOUT, NODE_CAPACITY]; Open is kCorruption.
 TEST_F(BPlusTreeTest, OpenRejectsAnOutOfRangeFanout) {
-	GTEST_SKIP() << "TODO";
+	struct Case {
+		uint16_t leaf_max;
+		uint16_t internal_max;
+	};
+	const Case cases[] = {
+	    {static_cast<uint16_t>(MIN_FANOUT - 1), kFanout},
+	    {static_cast<uint16_t>(NODE_CAPACITY + 1), kFanout},
+	    {kFanout, static_cast<uint16_t>(MIN_FANOUT - 1)},
+	    {kFanout, static_cast<uint16_t>(NODE_CAPACITY + 1)},
+	};
+	for (const Case& c : cases) {
+		SCOPED_TRACE(testing::Message()
+		             << "leaf_max=" << c.leaf_max << " internal_max=" << c.internal_max);
+		StampHeader([&](IndexHeader& h) {
+			h.leaf_max = c.leaf_max;
+			h.internal_max = c.internal_max;
+		});
+		auto opened = BPlusTree::Open(*bpm_, tree_->HeaderPageId());
+		ASSERT_FALSE(opened.has_value());
+		EXPECT_EQ(opened.error().code(), ErrorCode::kCorruption);
+	}
 }
 
 // Open on a page id past the end of the file fails rather than handing back a tree.
 TEST_F(BPlusTreeTest, OpenOnAPageThatDoesNotExistFails) {
-	GTEST_SKIP() << "TODO";
+	auto opened = BPlusTree::Open(*bpm_, dm_->PageCount() + 10);
+	EXPECT_FALSE(opened.has_value());
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -264,18 +335,29 @@ TEST_F(BPlusTreeTest, OpenOnAPageThatDoesNotExistFails) {
 
 // Any key, including INT64_MIN and INT64_MAX, is kNotFound on a freshly created tree.
 TEST_F(BPlusTreeTest, GetOnAnEmptyTreeIsNotFound) {
-	GTEST_SKIP() << "TODO";
+	for (const index_key_t key : {INT64_MIN, index_key_t{-1}, index_key_t{0}, index_key_t{1}, INT64_MAX}) {
+		SCOPED_TRACE(testing::Message() << "key " << key);
+		auto rid = tree_->Get(key);
+		ASSERT_FALSE(rid.has_value());
+		EXPECT_EQ(rid.error().code(), ErrorCode::kNotFound);
+	}
 }
 
 // StampHeader height = 0; Get is kCorruption, not a read of the root with a garbage position.
 TEST_F(BPlusTreeTest, GetOnAZeroHeightHeaderIsCorruption) {
-	GTEST_SKIP() << "TODO";
+	StampHeader([](IndexHeader& h) { h.height = 0; });
+	auto rid = tree_->Get(0);
+	ASSERT_FALSE(rid.has_value());
+	EXPECT_EQ(rid.error().code(), ErrorCode::kCorruption);
 }
 
 // StampHeader height = 2 over a single root leaf; the descent asks AsInternal of a leaf and
 // reports kCorruption instead of walking off the tree.
 TEST_F(BPlusTreeTest, GetOnAHeightTooLargeIsCorruption) {
-	GTEST_SKIP() << "TODO";
+	StampHeader([](IndexHeader& h) { h.height = 2; });
+	auto rid = tree_->Get(0);
+	ASSERT_FALSE(rid.has_value());
+	EXPECT_EQ(rid.error().code(), ErrorCode::kCorruption);
 }
 
 // Grow the tree to height 2, StampHeader height = 1; the caller's AsLeaf on an internal root
@@ -315,18 +397,22 @@ TEST_F(BPlusTreeTest, KeysSurviveAReopen) {
 // [INT64_MIN, INT64_MAX] on a fresh tree: the first Next() is false, not an entry read past
 // the empty root leaf's count.
 TEST_F(BPlusTreeTest, ScanOnAnEmptyTreeYieldsNothing) {
-	GTEST_SKIP() << "TODO";
+	EXPECT_TRUE(CollectScan(INT64_MIN, INT64_MAX).empty());
 }
 
 // lo > hi yields nothing, with no special case: LowerBound(lo) lands on a key above hi. Check
 // on an empty tree now, and again once Insert exists with lo and hi both inside the key range.
 TEST_F(BPlusTreeTest, ScanWithLoAboveHiYieldsNothing) {
-	GTEST_SKIP() << "TODO";
+	EXPECT_TRUE(CollectScan(10, 5).empty());
+	EXPECT_TRUE(CollectScan(INT64_MAX, INT64_MIN).empty());
 }
 
 // StampHeader height = 0; Scan itself fails with kCorruption, before any iterator exists.
 TEST_F(BPlusTreeTest, ScanOnAZeroHeightHeaderIsCorruption) {
-	GTEST_SKIP() << "TODO";
+	StampHeader([](IndexHeader& h) { h.height = 0; });
+	auto it = tree_->Scan(INT64_MIN, INT64_MAX);
+	ASSERT_FALSE(it.has_value());
+	EXPECT_EQ(it.error().code(), ErrorCode::kCorruption);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -390,7 +476,15 @@ TEST_F(BPlusTreeTest, LeafChainSurvivesAReopen) {
 
 // Once Next() has returned false, it keeps returning false, and the pool shows no pin held.
 TEST_F(BPlusTreeTest, NextIsIdempotentOnceExhausted) {
-	GTEST_SKIP() << "TODO";
+	auto it = tree_->Scan(INT64_MIN, INT64_MAX);
+	ASSERT_TRUE(it.has_value()) << it.error().message();
+	for (int i = 0; i < 3; i++) {
+		SCOPED_TRACE(testing::Message() << "call " << i);
+		auto more = it->Next();
+		ASSERT_TRUE(more.has_value()) << more.error().message();
+		EXPECT_FALSE(more.value());
+		EXPECT_EQ(bpm_->GetStats().pinned_frames, 0u);
+	}
 }
 
 // Key() and Rid() are copies: they still name the entry after the iterator has moved on to the
@@ -414,7 +508,19 @@ TEST_F(BPlusTreeTest, ExhaustedIteratorHoldsNoPin) {
 // Move-construct from an iterator; the source's Next() is false, and the destination continues
 // from exactly where the source was. Check on an empty tree now, mid-scan once Insert exists.
 TEST_F(BPlusTreeTest, MovedFromIteratorIsExhausted) {
-	GTEST_SKIP() << "TODO";
+	auto source = tree_->Scan(INT64_MIN, INT64_MAX);
+	ASSERT_TRUE(source.has_value()) << source.error().message();
+
+	IndexIterator dest(std::move(source.value()));
+
+	auto from_source = source->Next();
+	ASSERT_TRUE(from_source.has_value()) << from_source.error().message();
+	EXPECT_FALSE(from_source.value());
+
+	auto from_dest = dest.Next();
+	ASSERT_TRUE(from_dest.has_value()) << from_dest.error().message();
+	EXPECT_FALSE(from_dest.value());
+	EXPECT_EQ(bpm_->GetStats().pinned_frames, 0u);
 }
 
 // Move-assign a mid-scan iterator over another mid-scan iterator on a different leaf;
