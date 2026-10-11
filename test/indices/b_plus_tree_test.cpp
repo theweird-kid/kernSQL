@@ -195,7 +195,37 @@ TEST_F(BPlusTreeTest, CreateDoesNotTakeAReservedPage) {
 // leaf_max and internal_max below MIN_FANOUT or above NODE_CAPACITY are kInvalidArgument, and
 // no page is allocated: the next NewPage() gets the id it would have got anyway.
 TEST_F(BPlusTreeTest, CreateRejectsFanoutOutOfRange) {
-	GTEST_SKIP() << "TODO";
+	// SetUp's Create left the free list empty, so the next allocation extends the file and its id
+	// is the current page count.
+	const page_id_t before = dm_->PageCount();
+
+	// One bad argument per case, the other valid: Create checks leaf_max first and returns, so a
+	// case with both bad never reaches the internal_max check.
+	struct Case {
+		uint16_t leaf_max;
+		uint16_t internal_max;
+	};
+	const Case cases[] = {
+	    {static_cast<uint16_t>(MIN_FANOUT - 1), kFanout},
+	    {static_cast<uint16_t>(NODE_CAPACITY + 1), kFanout},
+	    {kFanout, static_cast<uint16_t>(MIN_FANOUT - 1)},
+	    {kFanout, static_cast<uint16_t>(NODE_CAPACITY + 1)},
+	};
+	for (const Case& c : cases) {
+		SCOPED_TRACE(testing::Message()
+		             << "leaf_max=" << c.leaf_max << " internal_max=" << c.internal_max);
+		auto tree = BPlusTree::Create(*bpm_, c.leaf_max, c.internal_max);
+		ASSERT_FALSE(tree.has_value());
+		EXPECT_EQ(tree.error().code(), ErrorCode::kInvalidArgument);
+	}
+
+	// Nothing grew the file, and the next id is still the one it would have been. The probe is
+	// what catches a leak once the free list is non-empty: a leaked page taken from the free list
+	// leaves PageCount alone but moves the next id.
+	EXPECT_EQ(dm_->PageCount(), before);
+	auto probe = bpm_->NewPage();
+	ASSERT_TRUE(probe.has_value()) << probe.error().message();
+	EXPECT_EQ(probe->PageId(), before);
 }
 
 // MIN_FANOUT and NODE_CAPACITY themselves are accepted — the range is closed at both ends.
