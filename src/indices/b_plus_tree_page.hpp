@@ -397,6 +397,49 @@ class InternalNode {
 };
 
 /*
+ * The two splits Insert is built from (DD-005, "Leaf split", "Internal split"). Pure functions over
+ * views, like the views themselves: no buffer pool, no fanout, no tree. They cut whatever they are
+ * given in half; WHETHER a node splits is BPlusTree's question, answered against its fanout. That
+ * is what lets the split arithmetic be tested on bare byte arrays.
+ *
+ * Both take `left` — the node receiving `entry`, holding Count() entries — and an EMPTY `right`,
+ * already stamped and Init'd by the caller (page type through the guard, level through Init).
+ * Both build the Count() + 1 result in a temporary array FIRST, with `entry` placed at `index`,
+ * then cut it and Assign each half whole: no in-place moves between the two pages, and no case
+ * analysis on which half the new entry lands in. Assign zeroes past the new counts, so both pages
+ * stay canonical.
+ *
+ * Both return the separator for the parent, which the caller inserts as (separator, right's page
+ * id) immediately after the parent's entry for `left`.
+ */
+
+/*
+ * Leaves COPY UP. Left keeps the first ceil((n + 1) / 2) entries, right takes the rest, and the
+ * separator is right's first key — which stays in right as a real entry.
+ *
+ * Also rewires the chain: right's NextLeaf becomes left's old NextLeaf, THEN left's becomes
+ * `right_page_id`. The reverse order loses every leaf to the right.
+ *
+ * Preconditions, asserted: 1 <= left.Count() <= NODE_CAPACITY, index <= left.Count(),
+ * right.Count() == 0. `index` is the LowerBound the tree already computed; ordering and
+ * duplicates are not checked.
+ */
+[[nodiscard]] index_key_t SplitLeaf(LeafNode left, LeafNode right, page_id_t right_page_id,
+                                    uint16_t index, const LeafEntry& entry);
+
+/*
+ * Internal nodes MOVE UP. With m = ceil((n + 1) / 2): left keeps temp[0, m); temp[m].key is the
+ * returned separator and stays in NEITHER half; right gets temp[m] as its entry[0] — the child is
+ * kept, the key becomes INT64_MIN (Assign writes that anyway) — followed by temp[m + 1 ..].
+ * Children are conserved: left + right == n + 1.
+ *
+ * Preconditions, asserted: 2 <= left.Count() <= NODE_CAPACITY, 1 <= index <= left.Count() (never
+ * 0, same rule as InsertAt), right.Count() == 0, right.Level() == left.Level().
+ */
+[[nodiscard]] index_key_t SplitInternal(InternalNode left, InternalNode right, uint16_t index,
+                                        const InternalEntry& entry);
+
+/*
  * The only way to get a node view in non-test code, for the same reason AsHeapPage exists: a view
  * sees only the body and cannot check page_type, so a view built over the wrong page type parses
  * garbage and scribbles on it. The guard can see the header. kCorruption on mismatch.

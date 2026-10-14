@@ -221,6 +221,65 @@ class BPlusTree {
 	[[nodiscard]] Result<ReadPageGuard> FindLeafRead(index_key_t key);
 
 	/*
+	 * Everything a writer holds for the length of one operation (DD-005, "Writers: the whole path
+	 * is held"). Built by FindLeafWrite; every guard lives until the operation returns, so a split
+	 * finds its parent already latched and unchanged.
+	 */
+	struct WritePath {
+		// Held from the start although only a root change writes it: by then nothing may fail,
+		// and fetching it then could.
+		WritePageGuard header_guard;
+		IndexHeader header;
+
+		// Root first, leaf last. nodes.size() == header.height.
+		std::vector<WritePageGuard> nodes;
+
+		// child_indexes[i] is the child of nodes[i] the descent followed, so
+		// child_indexes.size() == nodes.size() - 1. A separator produced by splitting
+		// nodes[i + 1] goes into nodes[i] at child_indexes[i] + 1 — no second search.
+		std::vector<uint16_t> child_indexes;
+	};
+
+	/*
+	 * The write-path descent: write-latch the header, read root and height, then go down holding
+	 * a write guard on EVERY node, recording the child index taken at each level.
+	 *
+	 * Unlike FindLeafRead, validates every page's type on the way (AsInternal above the leaf,
+	 * AsLeaf at it), so after it returns, AsLeaf/AsInternal on the path cannot fail — Insert's
+	 * mutate phase relies on that. kCorruption on a zero height or a type mismatch.
+	 *
+	 * Pins header + height frames, all held until the WritePath dies.
+	 */
+	[[nodiscard]] Result<WritePath> FindLeafWrite(index_key_t key);
+
+	// Full against THIS TREE'S fanout (leaf_max_ / internal_max_), never NODE_CAPACITY — getting
+	// this wrong makes every small-fanout test silently stop splitting.
+	[[nodiscard]] bool IsLeafFull(ConstLeafNode leaf) const { return leaf.Count() >= leaf_max_; }
+	[[nodiscard]] bool IsInternalFull(ConstInternalNode node) const {
+		return node.Count() >= internal_max_;
+	}
+
+	/*
+	 * How many nodes an insert into this path will split: walking up from the leaf, the length of
+	 * the run of full nodes, stopping at the first one that is not full. A node splits only if it
+	 * is full AND receives an entry, and a parent receives one only when its child split.
+	 *
+	 * 0 means the leaf has room. A result equal to path.nodes.size() means the root splits too, and
+	 * Insert needs ONE MORE page for the new root. Reads only; called before any allocation.
+	 */
+	[[nodiscard]] uint16_t CountSplits(WritePath& path) const;
+
+	/*
+	 * Allocate `count` pages with NewPage, returned zeroed, typed ALLOCATED and write-latched —
+	 * the caller stamps each one before taking a view of it.
+	 *
+	 * All or nothing: if any NewPage fails, drop every guard already obtained, DeletePage each of
+	 * those pages (best effort — DeletePage rejects a pinned page, hence the drop first; a failed
+	 * delete leaks a page, which is what Create accepts too), and return the ORIGINAL error.
+	 */
+	[[nodiscard]] Result<std::vector<WritePageGuard>> AllocatePages(uint16_t count);
+
+	/*
 	 * CheckInvariants' recursive walk: check the subtree rooted at `page_id`, then each child's
 	 * subtree, left to right. False on the first violation, logged with the page it was found on.
 	 *

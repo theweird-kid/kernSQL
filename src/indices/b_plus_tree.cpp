@@ -270,8 +270,8 @@ bool BPlusTree::CheckInvariants() {
 	std::vector<std::pair<page_id_t, page_id_t>> leaves;
 
 	// height counts levels, the root's level is height - 1: a height-1 tree's root is a leaf.
-	if (!CheckSubtree(root_page_id, static_cast<uint16_t>(tree_height - 1), INT64_MIN,
-	                  std::nullopt, true, seen_pages, leaves)) {
+	if (!CheckSubtree(root_page_id, static_cast<uint16_t>(tree_height - 1), INT64_MIN, std::nullopt,
+	                  true, seen_pages, leaves)) {
 		return false;
 	}
 
@@ -279,8 +279,7 @@ bool BPlusTree::CheckInvariants() {
 	// it, and the last one points nowhere. Compared against a list of known length, so a cycle in
 	// the chain fails here instead of hanging a chain walk.
 	for (std::size_t i = 0; i < leaves.size(); i++) {
-		const page_id_t expected_next =
-		    i + 1 < leaves.size() ? leaves[i + 1].first : INVALID_PAGE;
+		const page_id_t expected_next = i + 1 < leaves.size() ? leaves[i + 1].first : INVALID_PAGE;
 		if (leaves[i].second != expected_next) {
 			LOG_DEBUG("leaf chain broken at leaf %zu (page %d): NextLeaf is %d, expected %d", i,
 			          leaves[i].first, leaves[i].second, expected_next);
@@ -411,4 +410,50 @@ bool BPlusTree::CheckSubtree(page_id_t page_id, uint16_t expected_level, index_k
 		leaves.push_back({page_id, leaf_node->NextLeaf()});
 		return true;
 	}
+}
+
+Result<BPlusTree::WritePath> BPlusTree::FindLeafWrite(index_key_t key) {
+	auto header_guard = bpm_.FetchPageWrite(header_page_id_);
+	if (!header_guard.has_value()) {
+		return std::unexpected(header_guard.error());
+	}
+
+	auto idx_header = ReadIndexHeader(header_guard.value());
+	if (!idx_header.has_value()) {
+		return std::unexpected(idx_header.error());
+	}
+	uint16_t tree_height = idx_header->height;
+	page_id_t root_page_id = idx_header->root_page_id;
+
+	if (tree_height == 0) {
+		return std::unexpected(Status::Corruption("tree height can't be 0"));
+	}
+
+	WritePath wr_path{std::move(header_guard.value()), idx_header.value(), {}, {}};
+
+	page_id_t next_page_id = root_page_id;
+	// Traverse the internal nodes
+	for (uint16_t height = 0; height + 1 < tree_height; height++) {
+		auto write_page = bpm_.FetchPageWrite(next_page_id);
+		if (!write_page.has_value()) return std::unexpected(write_page.error());
+
+		auto internal = AsInternal(write_page.value());
+		if (!internal.has_value()) return std::unexpected(internal.error());
+
+		auto child = internal->ChildIndexFor(key);
+		next_page_id = internal->ChildAt(child);
+
+		wr_path.nodes.emplace_back(std::move(write_page.value()));
+		wr_path.child_indexes.push_back(child);
+	}
+
+	// add the leaf node
+	auto leaf_page = bpm_.FetchPageWrite(next_page_id);
+	if (!leaf_page.has_value()) return std::unexpected(leaf_page.error());
+
+	auto leaf_node = AsLeaf(leaf_page.value());
+	if (!leaf_node.has_value()) return std::unexpected(leaf_node.error());
+
+	wr_path.nodes.emplace_back(std::move(leaf_page.value()));
+	return wr_path;
 }
