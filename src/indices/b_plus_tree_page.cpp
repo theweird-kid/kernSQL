@@ -1,10 +1,12 @@
 #include "b_plus_tree_page.hpp"
 
+#include <array>
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <expected>
+#include <span>
 
 #include "common/status.hpp"
 #include "common/types.hpp"
@@ -345,4 +347,58 @@ Status kernsql::WriteIndexHeader(WritePageGuard& guard, const IndexHeader& heade
 	}
 	header.WriteTo(guard.MutableBody());
 	return Status::OK();
+}
+
+index_key_t kernsql::SplitLeaf(LeafNode left, LeafNode right, page_id_t right_page_id,
+                               uint16_t index, const LeafEntry& entry) {
+	const uint16_t n = left.Count();
+	assert(1 <= n && n <= NODE_CAPACITY);
+	assert(index <= n);
+	assert(right.Count() == 0);
+
+	// The n + 1 result, with `entry` at `index`. Sized for a node at full physical capacity.
+	std::array<LeafEntry, NODE_CAPACITY + 1> temp;
+	for (uint16_t it = 0; it < index; it++) temp[it] = left.EntryAt(it);
+	temp[index] = entry;
+	for (uint16_t it = index; it < n; it++) temp[it + 1] = left.EntryAt(it);
+
+	const auto total = static_cast<std::size_t>(n) + 1;
+	const std::size_t m = (total + 1) / 2;
+
+	// Right takes left's old link BEFORE left is pointed at right, or the rest of the chain is
+	// lost. Assign rewrites only count and entries, so the links survive it.
+	right.SetNextLeaf(left.NextLeaf());
+	left.SetNextLeaf(right_page_id);
+
+	left.Assign(std::span<const LeafEntry>(temp.data(), m));
+	right.Assign(std::span<const LeafEntry>(temp.data() + m, total - m));
+
+	// Copy up: the separator stays in right as its first real entry.
+	return temp[m].key;
+}
+
+index_key_t kernsql::SplitInternal(InternalNode left, InternalNode right, uint16_t index,
+                                   const InternalEntry& entry) {
+	const uint16_t n = left.Count();
+	assert(2 <= n && n <= NODE_CAPACITY);
+	assert(1 <= index && index <= n);
+	assert(right.Count() == 0);
+	assert(right.Level() == left.Level());
+
+	std::array<InternalEntry, NODE_CAPACITY + 1> temp;
+	for (uint16_t it = 0; it < index; it++) temp[it] = left.EntryAt(it);
+	temp[index] = entry;
+	for (uint16_t it = index; it < n; it++) temp[it + 1] = left.EntryAt(it);
+
+	const auto total = static_cast<std::size_t>(n) + 1;
+	const std::size_t m = (total + 1) / 2;
+
+	// Move up: temp[m]'s key goes to the parent and stays in neither half. Its child becomes
+	// right's entry[0], whose key Assign overwrites with INT64_MIN.
+	const index_key_t sep = temp[m].key;
+
+	left.Assign(std::span<const InternalEntry>(temp.data(), m));
+	right.Assign(std::span<const InternalEntry>(temp.data() + m, total - m));
+
+	return sep;
 }

@@ -1,5 +1,8 @@
 #include "b_plus_tree.hpp"
 
+#include <array>
+#include <cassert>
+#include <cstddef>
 #include <cstdint>
 #include <expected>
 #include <optional>
@@ -217,14 +220,6 @@ Result<bool> IndexIterator::Next() {
 	return false;
 }
 
-/*
- * The whole-tree check (DD-005, "Invariants"): page types, levels, key order, SEPARATOR BOUNDS
- * carried down the recursion as a [lo, hi) interval, occupancy against the fanout, the leaf
- * chain matching the recursive walk, and no page reached twice.
- *
- * O(n). For tests, after every operation — never on a production path. Public so a test can
- * check a tree it drove through the public API alone.
- */
 bool BPlusTree::CheckInvariants() {
 	page_id_t root_page_id{INVALID_PAGE};
 	uint16_t tree_height{0};
@@ -456,4 +451,122 @@ Result<BPlusTree::WritePath> BPlusTree::FindLeafWrite(index_key_t key) {
 
 	wr_path.nodes.emplace_back(std::move(leaf_page.value()));
 	return wr_path;
+}
+
+Status BPlusTree::Insert(index_key_t key, RID rid) {
+	auto path = FindLeafWrite(key);
+	if (!path.has_value()) return path.error();
+
+	// Cannot fail: FindLeafWrite validated every page type on the path.
+	auto leaf_node = AsLeaf(path->nodes.back()).value();
+	const uint16_t idx = leaf_node.LowerBound(key);
+	if (idx < leaf_node.Count() && leaf_node.KeyAt(idx) == key) {
+		return Status::DuplicateKey("key " + std::to_string(key) + " already exists");
+	}
+
+	if (!IsLeafFull(leaf_node)) {
+		leaf_node.InsertAt(idx, LeafEntry{key, rid});
+		return Status::OK();
+	}
+
+	// Split. Plan and allocate first — the last point where anything may fail.
+	const uint16_t splits = CountSplits(path.value());
+	const bool new_root = (splits == path->nodes.size());
+	auto pages = AllocatePages(static_cast<uint16_t>(splits + (new_root ? 1 : 0)));
+	if (!pages.has_value()) return pages.error();
+
+	// ---- Nothing below this line may fail: every write runs to completion. ----
+
+	// pages[0] is the leaf's right half, pages[1 .. splits) the internal right halves going up,
+	// pages[splits] the new root when there is one.
+	auto& leaf_right_guard = (*pages)[0];
+	leaf_right_guard.SetPageType(PageType::INDEX_LEAF);
+	auto leaf_right = AsLeaf(leaf_right_guard).value();
+	leaf_right.Init();
+	index_key_t sep =
+	    SplitLeaf(leaf_node, leaf_right, leaf_right_guard.PageId(), idx, LeafEntry{key, rid});
+	page_id_t right_id = leaf_right_guard.PageId();
+
+	// Walk up the internal nodes. Signed, so the loop can step past the root to -1.
+	std::size_t next_page = 1;
+	for (int i = static_cast<int>(path->nodes.size()) - 2; i >= 0; i--) {
+		const auto level = static_cast<std::size_t>(i);
+		auto parent = AsInternal(path->nodes[level]).value();
+		const InternalEntry entry{sep, right_id, 0};
+		// Right after the child that split — recorded on the way down, no second search.
+		const auto pos = static_cast<uint16_t>(path->child_indexes[level] + 1);
+
+		if (!IsInternalFull(parent)) {
+			parent.InsertAt(pos, entry);
+			return Status::OK();
+		}
+
+		auto& right_guard = (*pages)[next_page++];
+		right_guard.SetPageType(PageType::INDEX_INTERNAL);
+		auto right = AsInternal(right_guard).value();
+		right.Init(parent.Level());
+		sep = SplitInternal(parent, right, pos, entry);
+		right_id = right_guard.PageId();
+	}
+
+	// The run of full nodes reached the root, so the root split: grow the tree by one level.
+	assert(new_root && next_page == splits);
+	auto& root_guard = (*pages)[next_page];
+	root_guard.SetPageType(PageType::INDEX_INTERNAL);
+	auto root = AsInternal(root_guard).value();
+
+	// The old root sits at level height - 1, so the new one is at height.
+	root.Init(path->header.height);
+	const std::array<InternalEntry, 2> children{
+	    InternalEntry{INT64_MIN, path->header.root_page_id, 0}, InternalEntry{sep, right_id, 0}};
+	root.Assign(children);
+
+	path->header.root_page_id = root_guard.PageId();
+	path->header.height++;
+
+	// Cannot fail: FindLeafWrite already read this page as INDEX_HEADER. Asserted rather than
+	// returned, because returning here would report failure for an insert that has happened.
+	[[maybe_unused]] const Status s = WriteIndexHeader(path->header_guard, path->header);
+	assert(s.ok());
+	return Status::OK();
+}
+
+uint16_t BPlusTree::CountSplits(WritePath& path) const {
+	// AsLeaf/AsInternal cannot fail: FindLeafWrite validated every page type on the path.
+	if (!IsLeafFull(*AsLeaf(path.nodes.back()))) return 0;
+	uint16_t splits = 1;
+
+	// Signed: a size_t counter is always >= 0 and would wrap past the root.
+	for (int i = static_cast<int>(path.nodes.size()) - 2; i >= 0; i--) {
+		if (!IsInternalFull(*AsInternal(path.nodes[static_cast<std::size_t>(i)]))) break;
+		++splits;
+	}
+	return splits;
+}
+
+Result<std::vector<WritePageGuard>> BPlusTree::AllocatePages(uint16_t count) {
+	std::vector<WritePageGuard> pages;
+	pages.reserve(count);
+
+	for (uint16_t i = 0; i < count; i++) {
+		auto page = bpm_.NewPage();
+		if (page.has_value()) {
+			pages.push_back(std::move(page.value()));
+			continue;
+		}
+
+		Status err = page.error();
+		std::vector<page_id_t> ids;
+		ids.reserve(pages.size());
+		for (auto& p : pages) ids.push_back(p.PageId());
+
+		// DeletePage rejects a pinned page, so drop every guard first. Best effort, as in Create:
+		// a failed delete leaks a page, and the caller still sees the error that caused this.
+		pages.clear();
+		for (page_id_t id : ids) (void)bpm_.DeletePage(id);
+
+		return std::unexpected(err);
+	}
+
+	return pages;
 }
