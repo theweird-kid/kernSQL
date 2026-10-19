@@ -19,6 +19,8 @@
 #include <utility>
 #include <vector>
 
+#include <unistd.h>
+
 #include "buffer/buffer_pool_manager.hpp"
 #include "buffer/page_guard.hpp"
 #include "buffer/pool_stats.hpp"
@@ -53,7 +55,8 @@ class TableHeapTest : public ::testing::Test {
 	void SetUp() override {
 		path_ = std::filesystem::temp_directory_path() /
 		        (std::string("kernsql_table_heap_test_") +
-		         testing::UnitTest::GetInstance()->current_test_info()->name());
+		         testing::UnitTest::GetInstance()->current_test_info()->name() +
+		         "_" + std::to_string(getpid()));
 		std::filesystem::remove(path_);
 
 		OpenPool();

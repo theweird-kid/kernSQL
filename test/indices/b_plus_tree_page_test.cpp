@@ -10,6 +10,9 @@
 #include <optional>
 #include <utility>
 #include <vector>
+#include <string>
+
+#include <unistd.h>
 
 #include "buffer/buffer_pool_manager.hpp"
 #include "buffer/page_guard.hpp"
@@ -27,7 +30,10 @@ class BPlusTreePageTest : public ::testing::Test {
   protected:
 	// A bare body: no DiskManager, no BufferPoolManager, no guard. Each test Inits it as the node
 	// type it needs. Starts zeroed, so "never Init()ed" is also testable.
-	void SetUp() override { body_.fill(std::byte{0}); }
+	void SetUp() override {
+		body_.fill(std::byte{0});
+		right_body_.fill(std::byte{0});
+	}
 
 	LeafNode Leaf() { return LeafNode(body_); }
 	ConstLeafNode LeafView() const { return ConstLeafNode(body_); }
@@ -61,10 +67,31 @@ class BPlusTreePageTest : public ::testing::Test {
 	// Offset of the first non-zero byte in body_[from, PAGE_BODY_SIZE), or nullopt if they are all
 	// zero. An offset, not a bool, so a failure says where the stray byte is.
 	std::optional<std::size_t> FirstNonZeroByte(std::size_t from) const {
+		return FirstNonZeroByte(body_, from);
+	}
+	static std::optional<std::size_t> FirstNonZeroByte(
+	    const std::array<std::byte, PAGE_BODY_SIZE>& body, std::size_t from) {
 		for (std::size_t off = from; off < PAGE_BODY_SIZE; ++off) {
-			if (body_[off] != std::byte{0}) return off;
+			if (body[off] != std::byte{0}) return off;
 		}
 		return std::nullopt;
+	}
+
+	// The second page a split needs: body_ is always the node that splits (left), this is the
+	// empty one it splits into (right).
+	LeafNode RightLeaf() { return LeafNode(right_body_); }
+	InternalNode RightInternal() { return InternalNode(right_body_); }
+
+	// Every entry of a node, in order — so a split's halves compare as whole vectors.
+	static std::vector<LeafEntry> EntriesOf(const LeafNode& node) {
+		std::vector<LeafEntry> out;
+		for (uint16_t i = 0; i < node.Count(); ++i) out.push_back(node.EntryAt(i));
+		return out;
+	}
+	static std::vector<InternalEntry> EntriesOf(const InternalNode& node) {
+		std::vector<InternalEntry> out;
+		for (uint16_t i = 0; i < node.Count(); ++i) out.push_back(node.EntryAt(i));
+		return out;
 	}
 
 	// A fresh database file and a 4-frame pool for the guard-level tests, torn down afterwards
@@ -72,7 +99,8 @@ class BPlusTreePageTest : public ::testing::Test {
 	// the file cleanup still run.
 	template <typename Fn>
 	static void WithBufferPool(const char* file_name, Fn&& fn) {
-		const auto path = std::filesystem::temp_directory_path() / file_name;
+		const auto path = std::filesystem::temp_directory_path() /
+		                  (std::string(file_name) + "_" + std::to_string(getpid()));
 		std::filesystem::remove(path);
 		auto dm = DiskManager::Open(path);
 		ASSERT_TRUE(dm.has_value()) << dm.error().message();
@@ -86,6 +114,7 @@ class BPlusTreePageTest : public ::testing::Test {
 	}
 
 	std::array<std::byte, PAGE_BODY_SIZE> body_{};
+	std::array<std::byte, PAGE_BODY_SIZE> right_body_{};
 };
 
 // ---------------------------------------------------------------------------------------------
@@ -788,6 +817,244 @@ TEST_F(BPlusTreePageTest, InternalCheckRejectsReservedChild) {
 }
 
 // ---------------------------------------------------------------------------------------------
+// SplitLeaf — copy up
+//
+// Left is LeafEntries(3) = 10 20 30 unless stated: 4 entries after the insert, cut 2 | 2.
+// ---------------------------------------------------------------------------------------------
+
+TEST_F(BPlusTreePageTest, SplitLeafNewEntryInTheLeftHalf) {
+	auto left = Leaf();
+	left.Init();
+	left.Assign(LeafEntries(3));
+	auto right = RightLeaf();
+	right.Init();
+
+	const LeafEntry entry{5, RID{9, 9}};
+	const index_key_t sep = SplitLeaf(left, right, 7, 0, entry);
+
+	const std::vector<LeafEntry> want_left{entry, {10, RID{2, 0}}};
+	const std::vector<LeafEntry> want_right{{20, RID{2, 1}}, {30, RID{2, 2}}};
+	EXPECT_EQ(EntriesOf(left), want_left);
+	EXPECT_EQ(EntriesOf(right), want_right);
+	EXPECT_EQ(sep, 20);
+}
+
+TEST_F(BPlusTreePageTest, SplitLeafNewEntryInTheRightHalf) {
+	auto left = Leaf();
+	left.Init();
+	left.Assign(LeafEntries(3));
+	auto right = RightLeaf();
+	right.Init();
+
+	const LeafEntry entry{40, RID{9, 9}};
+	const index_key_t sep = SplitLeaf(left, right, 7, 3, entry);
+
+	const std::vector<LeafEntry> want_left{{10, RID{2, 0}}, {20, RID{2, 1}}};
+	const std::vector<LeafEntry> want_right{{30, RID{2, 2}}, entry};
+	EXPECT_EQ(EntriesOf(left), want_left);
+	EXPECT_EQ(EntriesOf(right), want_right);
+	EXPECT_EQ(sep, 30);
+}
+
+// The new entry lands exactly on the cut: it becomes right's first entry AND the separator, and
+// stays in right — copy up, not move up.
+TEST_F(BPlusTreePageTest, SplitLeafNewEntryAtTheCutIsCopiedUp) {
+	auto left = Leaf();
+	left.Init();
+	left.Assign(LeafEntries(3));
+	auto right = RightLeaf();
+	right.Init();
+
+	const LeafEntry entry{25, RID{9, 9}};
+	const index_key_t sep = SplitLeaf(left, right, 7, 2, entry);
+
+	const std::vector<LeafEntry> want_left{{10, RID{2, 0}}, {20, RID{2, 1}}};
+	const std::vector<LeafEntry> want_right{entry, {30, RID{2, 2}}};
+	EXPECT_EQ(EntriesOf(left), want_left);
+	EXPECT_EQ(EntriesOf(right), want_right);
+	EXPECT_EQ(sep, 25);
+	EXPECT_EQ(sep, right.KeyAt(0));
+}
+
+// An odd total: left keeps the larger half, ceil(5 / 2) = 3.
+TEST_F(BPlusTreePageTest, SplitLeafOddTotalLeftKeepsTheLargerHalf) {
+	auto left = Leaf();
+	left.Init();
+	left.Assign(LeafEntries(4));  // 10 20 30 40
+	auto right = RightLeaf();
+	right.Init();
+
+	const index_key_t sep = SplitLeaf(left, right, 7, 4, LeafEntry{50, RID{9, 9}});
+
+	ASSERT_EQ(left.Count(), 3);
+	ASSERT_EQ(right.Count(), 2);
+	EXPECT_EQ(left.KeyAt(2), 30);
+	EXPECT_EQ(right.KeyAt(0), 40);
+	EXPECT_EQ(sep, 40);
+}
+
+// Right inherits left's old NextLeaf, and left points at right — in a chain a -> left -> c, the
+// result is left -> right -> c. Also with left at the end of the chain.
+TEST_F(BPlusTreePageTest, SplitLeafRewiresTheChain) {
+	for (const page_id_t old_next : {page_id_t{42}, INVALID_PAGE}) {
+		SCOPED_TRACE(testing::Message() << "left's old next " << old_next);
+		body_.fill(std::byte{0});
+		right_body_.fill(std::byte{0});
+		auto left = Leaf();
+		left.Init();
+		left.Assign(LeafEntries(3));
+		left.SetNextLeaf(old_next);
+		auto right = RightLeaf();
+		right.Init();
+
+		(void)SplitLeaf(left, right, 7, 3, LeafEntry{40, RID{9, 9}});
+
+		EXPECT_EQ(left.NextLeaf(), 7);
+		EXPECT_EQ(right.NextLeaf(), old_next);
+	}
+}
+
+// A node at full physical capacity: halves of 127 and 127, keys contiguous across the cut, both
+// halves valid, level 0, and every byte past each count zero.
+TEST_F(BPlusTreePageTest, SplitLeafAtCapacityLeavesBothHalvesCanonical) {
+	auto left = Leaf();
+	left.Init();
+	left.Assign(LeafEntries(NODE_CAPACITY));  // 10 .. 2530
+	auto right = RightLeaf();
+	right.Init();
+
+	const LeafEntry entry{2540, RID{9, 9}};
+	const index_key_t sep = SplitLeaf(left, right, 7, NODE_CAPACITY, entry);
+
+	constexpr uint16_t kLeftCount = (NODE_CAPACITY + 2) / 2;
+	ASSERT_EQ(left.Count(), kLeftCount);
+	ASSERT_EQ(right.Count(), NODE_CAPACITY + 1 - kLeftCount);
+	EXPECT_EQ(left.KeyAt(kLeftCount - 1), 10 * kLeftCount);
+	EXPECT_EQ(right.KeyAt(0), 10 * (kLeftCount + 1));
+	EXPECT_EQ(right.EntryAt(right.Count() - 1), entry);
+	EXPECT_EQ(sep, right.KeyAt(0));
+
+	EXPECT_TRUE(left.CheckInvariants());
+	EXPECT_TRUE(right.CheckInvariants());
+	EXPECT_EQ(left.Header().level, 0);
+	EXPECT_EQ(right.Header().level, 0);
+	EXPECT_EQ(FirstNonZeroByte(body_, NodeEntryOffset(left.Count())), std::nullopt);
+	EXPECT_EQ(FirstNonZeroByte(right_body_, NodeEntryOffset(right.Count())), std::nullopt);
+}
+
+// ---------------------------------------------------------------------------------------------
+// SplitInternal — move up
+//
+// Left is InternalEntries(3) = [MIN,2] [10,3] [20,4] unless stated: 4 children after the insert,
+// cut 2 | 2, and temp[2]'s key goes to the parent.
+// ---------------------------------------------------------------------------------------------
+
+TEST_F(BPlusTreePageTest, SplitInternalNewEntryInTheLeftHalf) {
+	auto left = Internal();
+	left.Init(1);
+	left.Assign(InternalEntries(3));
+	auto right = RightInternal();
+	right.Init(1);
+
+	// temp: [MIN,2] [5,9] [10,3] [20,4]
+	const index_key_t sep = SplitInternal(left, right, 1, InternalEntry{5, 9});
+
+	const std::vector<InternalEntry> want_left{{INT64_MIN, 2}, {5, 9}};
+	const std::vector<InternalEntry> want_right{{INT64_MIN, 3}, {20, 4}};
+	EXPECT_EQ(EntriesOf(left), want_left);
+	EXPECT_EQ(EntriesOf(right), want_right);
+	EXPECT_EQ(sep, 10);
+}
+
+TEST_F(BPlusTreePageTest, SplitInternalNewEntryInTheRightHalf) {
+	auto left = Internal();
+	left.Init(1);
+	left.Assign(InternalEntries(3));
+	auto right = RightInternal();
+	right.Init(1);
+
+	// temp: [MIN,2] [10,3] [20,4] [30,9]
+	const index_key_t sep = SplitInternal(left, right, 3, InternalEntry{30, 9});
+
+	const std::vector<InternalEntry> want_left{{INT64_MIN, 2}, {10, 3}};
+	const std::vector<InternalEntry> want_right{{INT64_MIN, 4}, {30, 9}};
+	EXPECT_EQ(EntriesOf(left), want_left);
+	EXPECT_EQ(EntriesOf(right), want_right);
+	EXPECT_EQ(sep, 20);
+}
+
+// The new entry lands on the cut: its key is the separator and appears in NEITHER half; its child
+// becomes right's entry[0].
+TEST_F(BPlusTreePageTest, SplitInternalNewEntryAtTheCutIsMovedUp) {
+	auto left = Internal();
+	left.Init(1);
+	left.Assign(InternalEntries(3));
+	auto right = RightInternal();
+	right.Init(1);
+
+	// temp: [MIN,2] [10,3] [15,9] [20,4]
+	const index_key_t sep = SplitInternal(left, right, 2, InternalEntry{15, 9});
+
+	const std::vector<InternalEntry> want_left{{INT64_MIN, 2}, {10, 3}};
+	const std::vector<InternalEntry> want_right{{INT64_MIN, 9}, {20, 4}};
+	EXPECT_EQ(EntriesOf(left), want_left);
+	EXPECT_EQ(EntriesOf(right), want_right);
+	EXPECT_EQ(sep, 15);
+}
+
+// An odd total: left keeps ceil(5 / 2) = 3 children, right 2, and no child is lost or doubled.
+TEST_F(BPlusTreePageTest, SplitInternalOddTotalConservesChildren) {
+	auto left = Internal();
+	left.Init(1);
+	left.Assign(InternalEntries(4));  // [MIN,2] [10,3] [20,4] [30,5]
+	auto right = RightInternal();
+	right.Init(1);
+
+	// temp: [MIN,2] [10,3] [20,4] [30,5] [40,9]
+	const index_key_t sep = SplitInternal(left, right, 4, InternalEntry{40, 9});
+
+	const std::vector<InternalEntry> want_left{{INT64_MIN, 2}, {10, 3}, {20, 4}};
+	const std::vector<InternalEntry> want_right{{INT64_MIN, 5}, {40, 9}};
+	EXPECT_EQ(EntriesOf(left), want_left);
+	EXPECT_EQ(EntriesOf(right), want_right);
+	EXPECT_EQ(sep, 30);
+}
+
+// A node at full physical capacity: children conserved and in order across both halves, the
+// separator strictly between left's last key and right's first, both halves valid at the
+// original level, and every byte past each count zero.
+TEST_F(BPlusTreePageTest, SplitInternalAtCapacityLeavesBothHalvesCanonical) {
+	auto left = Internal();
+	left.Init(3);
+	left.Assign(InternalEntries(NODE_CAPACITY));  // children 2 .. 254, separators 10 .. 2520
+	auto right = RightInternal();
+	right.Init(3);
+
+	const InternalEntry entry{10 * NODE_CAPACITY, 2 + NODE_CAPACITY};
+	const index_key_t sep = SplitInternal(left, right, NODE_CAPACITY, entry);
+
+	ASSERT_EQ(left.Count() + right.Count(), NODE_CAPACITY + 1);
+	EXPECT_EQ(left.Count(), (NODE_CAPACITY + 2) / 2);
+	std::vector<page_id_t> children;
+	for (uint16_t i = 0; i < left.Count(); ++i) children.push_back(left.ChildAt(i));
+	for (uint16_t i = 0; i < right.Count(); ++i) children.push_back(right.ChildAt(i));
+	for (std::size_t i = 0; i < children.size(); ++i) {
+		EXPECT_EQ(children[i], static_cast<page_id_t>(2 + i)) << "child " << i;
+	}
+
+	EXPECT_LT(left.KeyAt(left.Count() - 1), sep);
+	EXPECT_LT(sep, right.KeyAt(1));
+	EXPECT_EQ(sep, 10 * left.Count());
+
+	EXPECT_TRUE(left.CheckInvariants());
+	EXPECT_TRUE(right.CheckInvariants());
+	EXPECT_EQ(left.Level(), 3);
+	EXPECT_EQ(right.Level(), 3);
+	EXPECT_EQ(FirstNonZeroByte(body_, NodeEntryOffset(left.Count())), std::nullopt);
+	EXPECT_EQ(FirstNonZeroByte(right_body_, NodeEntryOffset(right.Count())), std::nullopt);
+}
+
+// ---------------------------------------------------------------------------------------------
 // IndexHeader on a bare body
 // ---------------------------------------------------------------------------------------------
 
@@ -962,7 +1229,8 @@ TEST_F(BPlusTreePageTest, WriteIndexHeaderRejectsANonHeaderPageWithoutWriting) {
 // Write, Shutdown, reopen, read back: survives a trip through disk, not just the frame.
 TEST_F(BPlusTreePageTest, IndexHeaderSurvivesFlushAndReopen) {
 	// By hand rather than WithBufferPool: the file has to be closed and opened again mid-test.
-	const auto path = std::filesystem::temp_directory_path() / "kernsql_bptree_header_reopen_test";
+	const auto path = std::filesystem::temp_directory_path() /
+	                  (std::string("kernsql_bptree_header_reopen_test_") + std::to_string(getpid()));
 	std::filesystem::remove(path);
 
 	// Every field off its default and distinct from the others, so neither an unwritten field nor

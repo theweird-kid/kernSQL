@@ -14,6 +14,8 @@
 #include <string_view>
 #include <vector>
 
+#include <unistd.h>
+
 #include "buffer/buffer_pool_manager.hpp"
 #include "buffer/page_guard.hpp"
 #include "common/status.hpp"
@@ -1035,7 +1037,8 @@ TEST_F(HeapPageTest, CheckInvariantsRejectsOverlappingTuples) {
 
 // Needs a real guard, so this pair reaches for a BufferPoolManager where nothing else here does.
 TEST_F(HeapPageTest, AsHeapPageRejectsAPageThatIsNotAHeapPage) {
-	const auto path = std::filesystem::temp_directory_path() / "kernsql_asheap_reject_test";
+	const auto path = std::filesystem::temp_directory_path() /
+	                  (std::string("kernsql_asheap_reject_test_") + std::to_string(getpid()));
 	std::filesystem::remove(path);
 	auto dm = DiskManager::Open(path);
 	ASSERT_TRUE(dm.has_value()) << dm.error().message();
@@ -1067,7 +1070,8 @@ TEST_F(HeapPageTest, AsHeapPageRejectsAPageThatIsNotAHeapPage) {
 }
 
 TEST_F(HeapPageTest, AsHeapPageAcceptsAHeapPage) {
-	const auto path = std::filesystem::temp_directory_path() / "kernsql_asheap_accept_test";
+	const auto path = std::filesystem::temp_directory_path() /
+	                  (std::string("kernsql_asheap_accept_test_") + std::to_string(getpid()));
 	std::filesystem::remove(path);
 	auto dm = DiskManager::Open(path);
 	ASSERT_TRUE(dm.has_value()) << dm.error().message();

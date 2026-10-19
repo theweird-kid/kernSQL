@@ -1,6 +1,7 @@
 # B+tree Index
 
-**Status:** Draft — under review
+**Status:** Accepted for phase 1 — search, insert and range scan implemented and tested.
+Phase 2 (delete: redistribute, merge, root collapse) still under review.
 **Component:** `src/indices` (`BPlusTree`, `IndexIterator` in `b_plus_tree.hpp`; node views in `b_plus_tree_page.hpp`)
 
 The primary-key index. Maps a unique `int64` key to the `RID` of the row that holds it, so that
@@ -453,10 +454,18 @@ the index arithmetic gets debugged.
 
 **The randomised differential test is the centrepiece.** A seeded PRNG drives a long sequence of
 inserts, deletes, point lookups and range scans against the tree and against a `std::map` in
-lockstep; every result must match, and `CheckInvariants()` runs after every operation. At fanout
+lockstep; every result must match, and `CheckInvariants()` runs at a fixed interval. At fanout
 4, a few thousand operations exercise every split, redistribution, merge and root change many
 times over. The seed goes into a `SCOPED_TRACE`, so any failure reproduces exactly from its
 output. This one test finds more tree bugs than every hand-written case combined.
+
+As built (phase 1, `test/indices/b_plus_tree_differential_test.cpp`): inserts, point lookups and
+short range scans, no deletes yet; 2000 operations per run over five fanout pairs — 3/3, 4/4, 3/5,
+5/3 and `NODE_CAPACITY` — and five seeds, then a reopen and the full comparison again from disk.
+`CheckInvariants()` runs every 10th operation rather than every one: it walks the whole tree, and
+at every operation it dominated the run time (~13 s per run under ASan). A structural failure is
+therefore caught within 10 operations of its cause; set the interval to 1 and replay the seed to
+pin it to the exact one.
 
 Around it, the targeted cases:
 
