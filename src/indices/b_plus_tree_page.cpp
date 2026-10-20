@@ -402,3 +402,142 @@ index_key_t kernsql::SplitInternal(InternalNode left, InternalNode right, uint16
 
 	return sep;
 }
+
+index_key_t kernsql::RotateLeafRight(LeafNode left, LeafNode right) {
+	uint16_t n = left.Count();
+	uint16_t m = right.Count();
+
+	assert(n >= 2 && m < NODE_CAPACITY);
+	std::array<LeafEntry, 2 * NODE_CAPACITY> temp;
+	for (uint16_t it = 0; it < n; it++) {
+		temp[it] = left.EntryAt(it);
+	}
+	for (uint16_t it = 0; it < m; it++) {
+		temp[it + n] = right.EntryAt(it);
+	}
+
+	left.Assign(std::span(temp.data(), n - 1));
+	right.Assign(std::span(temp.data() + n - 1, m + 1));
+
+	return right.EntryAt(0).key;
+}
+
+index_key_t kernsql::RotateLeafLeft(LeafNode left, LeafNode right) {
+	uint16_t n = left.Count();
+	uint16_t m = right.Count();
+
+	assert(m >= 2 && n < NODE_CAPACITY);
+	std::array<LeafEntry, 2 * NODE_CAPACITY> temp;
+	for (uint16_t it = 0; it < n; it++) {
+		temp[it] = left.EntryAt(it);
+	}
+	for (uint16_t it = 0; it < m; it++) {
+		temp[it + n] = right.EntryAt(it);
+	}
+
+	left.Assign(std::span(temp.data(), n + 1));
+	right.Assign(std::span(temp.data() + n + 1, m - 1));
+
+	return right.EntryAt(0).key;
+}
+
+index_key_t kernsql::RotateInternalRight(InternalNode left, InternalNode right,
+                                         index_key_t separator) {
+	uint16_t n = left.Count();
+	uint16_t m = right.Count();
+
+	assert(n >= 2 && 1 <= m && m < NODE_CAPACITY);
+	assert(left.Level() == right.Level());
+	std::array<InternalEntry, 2 * NODE_CAPACITY> temp;
+
+	// temp = left's entries, then right's. temp[n - 1] is left's last child, the one that moves;
+	// temp[n] is right's old entry[0], whose INT64_MIN placeholder becomes the separator that
+	// comes down.
+	for (uint16_t it = 0; it < n; it++) {
+		temp[it] = left.EntryAt(it);
+	}
+	for (uint16_t it = 0; it < m; it++) {
+		temp[it + n] = right.EntryAt(it);
+	}
+
+	// Read before anything is rewritten: left's last key is what goes up.
+	const index_key_t up = temp[n - 1].key;
+	temp[n].key = separator;
+
+	left.Assign(std::span(temp.data(), n - 1));
+	// Starts at the moved child. Assign writes INT64_MIN over `up` in right's entry[0].
+	right.Assign(std::span(temp.data() + n - 1, m + 1));
+
+	return up;
+}
+
+index_key_t kernsql::RotateInternalLeft(InternalNode left, InternalNode right,
+                                        index_key_t separator) {
+	uint16_t n = left.Count();
+	uint16_t m = right.Count();
+
+	assert(m >= 2 && 1 <= n && n < NODE_CAPACITY);
+	assert(left.Level() == right.Level());
+	std::array<InternalEntry, 2 * NODE_CAPACITY> temp;
+
+	// temp = left's entries, then right's. temp[n] is right's old entry[0], the child that moves;
+	// its INT64_MIN placeholder becomes the separator that comes down. temp[n + 1] is right's
+	// first real separator, the one that goes up.
+	for (uint16_t it = 0; it < n; it++) {
+		temp[it] = left.EntryAt(it);
+	}
+	for (uint16_t it = 0; it < m; it++) {
+		temp[it + n] = right.EntryAt(it);
+	}
+
+	// Right's KeyAt(1) — NOT temp[n].key, which is right's entry[0] placeholder (INT64_MIN).
+	const index_key_t up = temp[n + 1].key;
+	temp[n].key = separator;
+
+	// Left gains the moved child; right starts at its old entry[1], and Assign writes INT64_MIN
+	// over `up` in its new entry[0].
+	left.Assign(std::span(temp.data(), n + 1));
+	right.Assign(std::span(temp.data() + n + 1, m - 1));
+
+	return up;
+}
+
+void kernsql::MergeLeaf(LeafNode left, LeafNode right) {
+	uint16_t n = left.Count();
+	uint16_t m = right.Count();
+
+	assert(n + m <= NODE_CAPACITY);
+	std::array<LeafEntry, NODE_CAPACITY> temp;
+	for (uint16_t it = 0; it < n; it++) {
+		temp[it] = left.EntryAt(it);
+	}
+	for (uint16_t it = 0; it < m; it++) {
+		temp[it + n] = right.EntryAt(it);
+	}
+
+	left.Assign(std::span(temp.data(), n + m));
+	// Right is about to be freed; without this the chain points at a freed page. Assign leaves the
+	// link alone, so the order of the two doesn't matter.
+	left.SetNextLeaf(right.NextLeaf());
+}
+
+void kernsql::MergeInternal(InternalNode left, InternalNode right, index_key_t separator) {
+	uint16_t n = left.Count();
+	uint16_t m = right.Count();
+
+	assert(n >= 1 && m >= 1 && n + m <= NODE_CAPACITY);
+	assert(left.Level() == right.Level());
+	std::array<InternalEntry, NODE_CAPACITY> temp;
+
+	// temp = left's entries, then right's. temp[n] is right's old entry[0]: its INT64_MIN
+	// placeholder becomes the separator that comes down, since it bounds that child from below.
+	for (uint16_t it = 0; it < n; it++) {
+		temp[it] = left.EntryAt(it);
+	}
+	for (uint16_t it = 0; it < m; it++) {
+		temp[it + n] = right.EntryAt(it);
+	}
+	temp[n].key = separator;
+
+	left.Assign(std::span(temp.data(), n + m));
+}

@@ -165,12 +165,13 @@ class BPlusTree {
 	 * plain delete: they are routing information and stay correct bounds even when the key they
 	 * were copied from is gone.
 	 *
-	 * Cannot allocate everything up front the way Insert does, so it may fail partway; each level
-	 * is fully consistent before the next is touched, so the only invariant a partial delete can
-	 * break is occupancy. Merged-away pages are unlinked BEFORE they are freed, so a failed
-	 * DeletePage leaks a page and never leaves a dangling pointer.
+	 * All or nothing, like Insert: a read-only planning pass walks up from the leaf and fetches
+	 * every sibling the underflow cascade will need BEFORE the first write, so any error means the
+	 * tree is byte-for-byte unchanged. After that the only fallible step is freeing merged-away
+	 * pages; they are unlinked first, so a failed DeletePage leaks a page, never leaves a dangling
+	 * pointer, and is swallowed — OK means the key is gone.
 	 *
-	 * Frame budget at peak: header + H path + 1 sibling = H + 2.
+	 * Frame budget at peak: header + H path + up to H - 1 siblings = 2H.
 	 */
 	[[nodiscard]] Status Delete(index_key_t key);
 
@@ -278,6 +279,69 @@ class BPlusTree {
 	 * delete leaks a page, which is what Create accepts too), and return the ORIGINAL error.
 	 */
 	[[nodiscard]] Result<std::vector<WritePageGuard>> AllocatePages(uint16_t count);
+
+	// At or below the floor for THIS TREE'S fanout: losing one entry would underflow it. One
+	// predicate answers both of the planner's questions — "does this node underflow?" for the path
+	// node, "can it lend?" (no, if true) for its sibling. Non-root nodes only.
+	[[nodiscard]] bool IsLeafAtFloor(ConstLeafNode leaf) const {
+		return leaf.Count() <= LeafMinEntries(leaf_max_);
+	}
+	[[nodiscard]] bool IsInternalAtFloor(ConstInternalNode node) const {
+		return node.Count() <= InternalMinChildren(internal_max_);
+	}
+
+	/*
+	 * How one underflowing level gets fixed (DD-005, "Delete", step 2). Built by PlanDelete,
+	 * consumed by ApplyDeletePlan.
+	 */
+	struct DeleteStep {
+		enum class Fix : uint8_t { kRedistribute, kMerge };
+
+		// Under the SAME parent, write-latched, type and level already validated — so applying
+		// cannot fail.
+		WritePageGuard sibling;
+
+		// Left if the path node's child index is > 0, else right. Decides which node is `left`
+		// for the Rotate*/Merge* call, and where the separator between them sits in the parent:
+		// at the path node's child index if the sibling is left, at that index + 1 if right.
+		bool sibling_is_left{false};
+
+		Fix fix{Fix::kMerge};
+	};
+
+	struct DeletePlan {
+		// steps[k] fixes path.nodes[nodes.size() - 1 - k], so steps[0] is the leaf. Empty when the
+		// leaf does not underflow. Every step is a merge except possibly the last, which is the
+		// only one allowed to redistribute: a redistribute costs the parent nothing and ends the
+		// cascade.
+		std::vector<DeleteStep> steps;
+
+		// The cascade's last merge empties an internal root down to one child, which then
+		// replaces it.
+		bool collapse_root{false};
+	};
+
+	/*
+	 * Step 2 — the read-only planning pass, and the ONLY fallible part of Delete after the
+	 * descent. Walks up from the leaf deciding each level from counts alone, assuming exactly one
+	 * entry leaves each level it visits — which is exactly what ApplyDeletePlan then does. Writes
+	 * nothing; on any error the caller returns it with the tree untouched.
+	 *
+	 * Pins up to height - 1 siblings on top of the path: 2H frames at peak with the header.
+	 */
+	[[nodiscard]] Result<DeletePlan> PlanDelete(WritePath& path);
+
+	/*
+	 * Steps 4 and 5: apply `plan` bottom-up, after Delete has removed the entry from the leaf.
+	 * Cannot fail — every view it takes was validated by FindLeafWrite or PlanDelete, so it
+	 * asserts rather than checks.
+	 *
+	 * Frees nothing itself. Returns the page ids to free — each merge's right node, and the old
+	 * root on a collapse — ALREADY UNLINKED from the tree. The caller drops every guard (path and
+	 * plan) and only then DeletePage's each one, best effort: DeletePage rejects a pinned page,
+	 * and a failed free is a leak, swallowed (DD-005, "A failed free is a leak, not an error").
+	 */
+	[[nodiscard]] std::vector<page_id_t> ApplyDeletePlan(WritePath& path, DeletePlan& plan);
 
 	/*
 	 * CheckInvariants' recursive walk: check the subtree rooted at `page_id`, then each child's

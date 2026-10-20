@@ -570,3 +570,22 @@ Result<std::vector<WritePageGuard>> BPlusTree::AllocatePages(uint16_t count) {
 
 	return pages;
 }
+
+/*
+ * Remove `key`. kNotFound if absent. Phase 2 of DD-005: built after insert, search and split
+ * are complete and tested.
+ *
+ * Underflow redistributes from, or merges with, a sibling under the SAME parent — the left one
+ * if it exists, else the right. Always merges right into left. Separators are left alone by a
+ * plain delete: they are routing information and stay correct bounds even when the key they
+ * were copied from is gone.
+ *
+ * All or nothing, like Insert: a read-only planning pass walks up from the leaf and fetches
+ * every sibling the underflow cascade will need BEFORE the first write, so any error means the
+ * tree is byte-for-byte unchanged. After that the only fallible step is freeing merged-away
+ * pages; they are unlinked first, so a failed DeletePage leaks a page, never leaves a dangling
+ * pointer, and is swallowed — OK means the key is gone.
+ *
+ * Frame budget at peak: header + H path + up to H - 1 siblings = 2H.
+ */
+Status BPlusTree::Delete(index_key_t key) {}

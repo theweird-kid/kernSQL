@@ -1,7 +1,8 @@
 # B+tree Index
 
-**Status:** Accepted for phase 1 — search, insert and range scan implemented and tested.
-Phase 2 (delete: redistribute, merge, root collapse) still under review.
+**Status:** Accepted. Phase 1 — search, insert and range scan — implemented and tested.
+Phase 2 — delete: redistribute, merge, root collapse — design settled 2026-10-20 (all-or-nothing
+via a read-only planning pass), not yet implemented.
 **Component:** `src/indices` (`BPlusTree`, `IndexIterator` in `b_plus_tree.hpp`; node views in `b_plus_tree_page.hpp`)
 
 The primary-key index. Maps a unique `int64` key to the `RID` of the row that holds it, so that
@@ -248,7 +249,7 @@ The frame cost is bounded by the height, and the height is at most four:
 |---|---|
 | `Get`, scan | 1 |
 | `Insert` | header + `H` path + up to `H + 1` new pages = `2H + 2` → **10** at `H = 4` |
-| `Delete` | header + `H` path + 1 sibling = `H + 2` → **6** at `H = 4` |
+| `Delete` | header + `H` path + up to `H − 1` siblings = `2H` → **8** at `H = 4` |
 
 The pool must be at least that large, and a test asserts it: a tree driven to height 4 must keep
 working in a pool of exactly `2H + 2` frames. Tests that use a tiny fanout build much taller
@@ -325,24 +326,46 @@ Built after insert, search and split are complete and tested. It is additive —
 depends on it — and debugging two unfinished halves of a tree at once is how tree corruption
 becomes unfindable.
 
+**Delete is all or nothing, like insert.** Everything that can fail runs before the first byte
+changes; once mutation starts, nothing can fail except freeing a page, and a failed free is a
+leak, not an error (see [below](#a-failed-free-is-a-leak-not-an-error)).
+
 1. **Descend**, holding the path. If the key is absent, return `kNotFound`.
-2. **Remove the entry** from the leaf: shift the tail left, decrement `count`. Leave every
+2. **Plan the cascade — read-only.** Walk up from the leaf, deciding each level from counts alone:
+   - The level **underflows** if it is not the root and `count - 1` is below its minimum. If it
+     does not underflow, the cascade stops here.
+   - If it underflows, **fetch one sibling** and keep its write guard: the left sibling under the
+     same parent if there is one, else the right. Never a cousin under a different parent — the
+     parent holds the separator between two siblings, and that separator is what redistribution
+     and merge rewrite.
+   - If the sibling has more than the minimum, this level will **redistribute**. The parent loses
+     nothing, so the cascade stops.
+   - Otherwise this level will **merge**, its parent loses one entry, and the walk continues one
+     level up with that parent's `count - 1`.
+   - At the root: an internal root whose `count` will drop to 1 will **collapse**. A root never
+     needs a sibling.
+
+   The sibling fetches are the only fallible step a delete has. If any fails, drop every guard and
+   return the error — nothing has been written, and the key is still in the tree.
+3. **Remove the entry** from the leaf: shift the tail left, decrement `count`. Leave every
    separator above it alone — see [the corollary](#the-rule-everything-follows).
-3. **If the node is the root, or `count` is still at least the minimum,** done.
-4. **Otherwise it underflowed. Pick one sibling:** the left sibling under the same parent if there
-   is one, else the right. Never a cousin under a different parent — the parent holds the
-   separator between two siblings, and that separator is what redistribution and merge rewrite.
-5. **If the sibling has more than the minimum, redistribute** one entry (below). Done — the parent
-   loses nothing.
-6. **Otherwise merge** (below). The parent loses one entry and may underflow in turn; if so,
-   repeat from step 3 one level up.
-7. **Root collapse.** If the root is an internal node left with one child, write that child's id
-   into the header, decrement `height`, and free the old root. If the root is a leaf, it may shrink
-   to zero entries and stays: an empty tree is an empty leaf.
+4. **Apply the plan bottom-up**: at each planned level, redistribute (below) or merge (below) with
+   the sibling already in hand.
+5. **Root collapse.** If the plan reached the root and it is an internal node left with one child,
+   write that child's id into the header, decrement `height`, and free the old root — header
+   first, then the free. If the root is a leaf, it may shrink to zero entries and stays: an empty
+   tree is an empty leaf. A root never redistributes or merges; it only collapses.
+
+The plan and the apply must make the same decisions, so they read the same counts: the plan
+assumes exactly one entry leaves each level it visits, and that is exactly what the apply does.
+A `CheckInvariants()` after every delete in the differential test is what catches the two
+drifting apart.
 
 **Always merge right into left.** Whichever of the two nodes underflowed, the survivor is the left
 one and the right one is freed. One code path, one direction, and the leaf chain only ever loses
-a link it can repair from the node it already holds.
+a link it can repair from the node it already holds. Note that the right node is sometimes the
+path node itself (when the sibling chosen was the left one) and sometimes the sibling; either way
+its guard is the one dropped before the free.
 
 ### Redistribute
 
@@ -368,6 +391,9 @@ The internal cases are rotations, not moves: a key goes **down** from the parent
 key comes **up** from the sibling. Writing either as "move one entry across" puts a separator on
 the wrong side of its child.
 
+Like `SplitLeaf` / `SplitInternal`, these are free functions over node views that return the new
+parent separator, and they are tested on byte arrays before the tree uses them.
+
 ### Merge
 
 Let `L` be the left node, `R` the right, `S` the separator between them in the parent.
@@ -380,19 +406,19 @@ Let `L` be the left node, `R` the right, `S` the separator between them in the p
   must be gone first.
 
 **Unlink first, then free.** By the time `DeletePage` runs, nothing in the tree points at `R`, so
-the tree is correct whether or not the free succeeds. That matters because `DeletePage` can fail
-spuriously against a reclaimer's transient pin (DD-002, "Known behaviour"). A failed free is a
-leaked page — allocated and unreachable — never a dangling pointer.
+the tree is correct whether or not the free succeeds.
 
-### A delete that fails partway
+### A failed free is a leak, not an error
 
-Unlike insert, delete cannot allocate everything first: whether level 2 needs a sibling depends on
-what happened at level 1. So a sibling fetch at an upper level can fail after a lower level has
-already merged. The rule that makes this safe: **each level is fully consistent before the next
-one is touched.** A delete that stops partway leaves an underfull node above the level it
-finished — and occupancy is the only invariant it can break. The tree remains ordered, bounded,
-searchable and correctly chained; it is less full than it should be, which costs space and never
-correctness.
+`DeletePage` can fail spuriously against a reclaimer's transient pin (DD-002, "Known behaviour"),
+and it runs after the tree has already been rewritten. Returning that failure would tell the
+caller the delete did not happen when it did — and the caller is the table layer, which would
+then keep the heap row whose index entry is gone. So a failed free is swallowed: `Delete` returns
+OK, the page stays allocated and unreachable, and the tree is complete and correct. This is the
+same trade `Create` and `AllocatePages` already make on their cleanup paths.
+
+The contract `Delete` offers its caller is therefore exact: **OK means the key is gone; any error
+means the tree is byte-for-byte unchanged.**
 
 ## Range scan
 
@@ -478,6 +504,9 @@ Around it, the targeted cases:
 - a reopen test: build, `Shutdown`, reopen from the header page id, and replay the differential
   comparison against the saved `std::map`;
 - boundary keys: `INT64_MIN`, `INT64_MAX`, and ranges that start or end there;
+- delete fault injection: pin enough frames that a sibling fetch in the planning pass fails, and
+  assert the error comes back with the tree's pages byte-for-byte unchanged and the key still
+  found — the delete counterpart of insert's allocation-failure test;
 - the frame budget: a height-4 tree still works in a pool of exactly `2H + 2` frames.
 
 ## Concurrency

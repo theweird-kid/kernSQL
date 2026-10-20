@@ -440,6 +440,93 @@ class InternalNode {
                                         const InternalEntry& entry);
 
 /*
+ * The six fix-ups Delete is built from (DD-005, "Redistribute", "Merge"). Pure, like the splits:
+ * no pool, no fanout, no tree. WHETHER a node borrows or merges is BPlusTree's question; these
+ * only do it.
+ *
+ * Every one takes two ADJACENT siblings under the same parent IN KEY ORDER — `left` then `right` —
+ * regardless of which of them underflowed. The tree knows which side its sibling is on; these
+ * never need to. Same Assign discipline as the splits: read both nodes' entries into a temporary
+ * array, compute the result there, Assign each surviving node whole.
+ *
+ * `separator` is always the parent's key BETWEEN the two, i.e. the parent's KeyAt(i) where
+ * ChildAt(i) is `right`. The internal versions need it because it comes DOWN into a child; the
+ * leaf versions don't, because leaf separators are copies and a leaf never stores one.
+ *
+ * Rotations return the NEW separator; the caller writes it with SetKeyAt at that same index.
+ * Merges return nothing; the caller removes that same index from the parent with RemoveAt — it is
+ * never 0, since `right` is never the leftmost child, which is why "always merge right into left"
+ * also keeps InternalNode::RemoveAt's precondition true for free.
+ */
+
+/*
+ * Leaf, left lends to right: left's LAST entry becomes right's FIRST. Returns right's new first
+ * key — the entry that just moved.
+ *
+ * Preconditions, asserted: left.Count() >= 2 (a donor is never emptied), right.Count() <
+ * NODE_CAPACITY. right.Count() may be 0: at leaf_max 3 the floor is 1, so an underflowed leaf is
+ * empty.
+ */
+[[nodiscard]] index_key_t RotateLeafRight(LeafNode left, LeafNode right);
+
+/*
+ * Leaf, right lends to left: right's FIRST entry is appended to left. Returns right's new first
+ * key — NOT the entry that moved, which now lives in left and would put itself on the wrong side
+ * of the separator.
+ *
+ * Preconditions, asserted: right.Count() >= 2, left.Count() < NODE_CAPACITY.
+ */
+[[nodiscard]] index_key_t RotateLeafLeft(LeafNode left, LeafNode right);
+
+/*
+ * Internal, left lends to right — a rotation THROUGH the parent, not a move. Right gains a new
+ * entry[0]: its child is left's last child. Right's OLD entry[0] child now needs a real key in
+ * front of it, and that key is `separator`, which comes down. Left's last key goes up and is
+ * returned. Left drops its last entry.
+ *
+ * Right's new contents, in order: (anything, left's last child), (separator, right's old
+ * entry[0] child), right's old entry[1 ..]. Assign writes INT64_MIN into the first.
+ *
+ * Preconditions, asserted: left.Count() >= 2, 1 <= right.Count() < NODE_CAPACITY, equal levels.
+ */
+[[nodiscard]] index_key_t RotateInternalRight(InternalNode left, InternalNode right,
+                                              index_key_t separator);
+
+/*
+ * Internal, right lends to left — the mirror. Left gains (separator, right's entry[0] child) at
+ * its end: `separator` comes down because it bounded that child from below. Right's KeyAt(1) goes
+ * up and is returned. Right drops entry[0]; its old entry[1] becomes entry[0], and Assign resets
+ * that key to INT64_MIN.
+ *
+ * Preconditions, asserted: right.Count() >= 2, 1 <= left.Count() < NODE_CAPACITY, equal levels.
+ */
+[[nodiscard]] index_key_t RotateInternalLeft(InternalNode left, InternalNode right,
+                                             index_key_t separator);
+
+/*
+ * Leaf merge: append right's entries to left, then left.SetNextLeaf(right.NextLeaf()) — the link
+ * that would otherwise point at a freed page.
+ *
+ * Right is NOT modified: it is about to be unlinked from the parent and freed, nothing reads it
+ * again, and if the free fails it is a leaked page whose contents don't matter.
+ *
+ * Preconditions, asserted: left.Count() + right.Count() <= NODE_CAPACITY. Either may be empty.
+ */
+void MergeLeaf(LeafNode left, LeafNode right);
+
+/*
+ * Internal merge: left becomes left's entries, then (separator, right's entry[0] child), then
+ * right's entry[1 ..]. `separator` comes DOWN — it bounds right's first child and is about to live
+ * inside left. It adds no child, so the result holds left.Count() + right.Count() children.
+ *
+ * Right is not modified, as for MergeLeaf.
+ *
+ * Preconditions, asserted: left.Count() >= 1, right.Count() >= 1, left.Count() + right.Count()
+ * <= NODE_CAPACITY, equal levels.
+ */
+void MergeInternal(InternalNode left, InternalNode right, index_key_t separator);
+
+/*
  * The only way to get a node view in non-test code, for the same reason AsHeapPage exists: a view
  * sees only the body and cannot check page_type, so a view built over the wrong page type parses
  * garbage and scribbles on it. The guard can see the header. kCorruption on mismatch.
