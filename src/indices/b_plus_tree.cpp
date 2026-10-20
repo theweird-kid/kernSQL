@@ -571,21 +571,167 @@ Result<std::vector<WritePageGuard>> BPlusTree::AllocatePages(uint16_t count) {
 	return pages;
 }
 
-/*
- * Remove `key`. kNotFound if absent. Phase 2 of DD-005: built after insert, search and split
- * are complete and tested.
- *
- * Underflow redistributes from, or merges with, a sibling under the SAME parent — the left one
- * if it exists, else the right. Always merges right into left. Separators are left alone by a
- * plain delete: they are routing information and stay correct bounds even when the key they
- * were copied from is gone.
- *
- * All or nothing, like Insert: a read-only planning pass walks up from the leaf and fetches
- * every sibling the underflow cascade will need BEFORE the first write, so any error means the
- * tree is byte-for-byte unchanged. After that the only fallible step is freeing merged-away
- * pages; they are unlinked first, so a failed DeletePage leaks a page, never leaves a dangling
- * pointer, and is swallowed — OK means the key is gone.
- *
- * Frame budget at peak: header + H path + up to H - 1 siblings = 2H.
- */
-Status BPlusTree::Delete(index_key_t key) {}
+Status BPlusTree::Delete(index_key_t key) {
+	std::vector<page_id_t> to_free;
+	{
+		auto path = FindLeafWrite(key);
+		if (!path.has_value()) return path.error();
+
+		// Cannot fail: FindLeafWrite validated every page type on the path.
+		auto leaf = AsLeaf(path->nodes.back()).value();
+		const uint16_t idx = leaf.LowerBound(key);
+		if (idx == leaf.Count() || leaf.KeyAt(idx) != key) {
+			return Status::NotFound("key " + std::to_string(key) + " not in index");
+		}
+
+		// Fetch every sibling the cascade needs — the last point where anything may fail.
+		auto plan = PlanDelete(path.value());
+		if (!plan.has_value()) return plan.error();
+
+		// ---- Nothing below this line may fail: every write runs to completion. ----
+
+		leaf.RemoveAt(idx);
+		to_free = ApplyDeletePlan(path.value(), plan.value());
+
+		// The path, header and sibling guards all die here. They must: DeletePage rejects a
+		// pinned page, so freeing while any of them lives would fail every time.
+	}
+
+	// Already unlinked, so the tree is correct whether or not these succeed. A failed free leaks
+	// the page and is swallowed: the key is gone, and an error would tell the caller otherwise.
+	for (page_id_t id : to_free) (void)bpm_.DeletePage(id);
+	return Status::OK();
+}
+
+Result<BPlusTree::DeletePlan> BPlusTree::PlanDelete(WritePath& path) {
+	DeletePlan plan;
+	const std::size_t leaf_level = path.nodes.size() - 1;
+
+	// Bottom-up, stopping before the root (level 0), which never borrows or merges. Every
+	// iteration after the first runs only because the level below merged, so this node is the
+	// one losing an entry.
+	for (std::size_t level = leaf_level; level > 0; level--) {
+		const bool is_leaf = (level == leaf_level);
+
+		// Cannot fail: FindLeafWrite validated every page type on the path.
+		const bool at_floor = is_leaf ? IsLeafAtFloor(AsLeaf(path.nodes[level]).value())
+		                              : IsInternalAtFloor(AsInternal(path.nodes[level]).value());
+		if (!at_floor) return plan;
+
+		// Same parent only: left neighbour if there is one, else right. A parent always has at
+		// least two children, so the right one exists when the left doesn't.
+		auto parent = AsInternal(path.nodes[level - 1]).value();
+		const uint16_t child_index = path.child_indexes[level - 1];
+		const bool sibling_is_left = child_index > 0;
+		const page_id_t sibling_id = parent.ChildAt(
+		    static_cast<uint16_t>(sibling_is_left ? child_index - 1 : child_index + 1));
+
+		auto sibling = bpm_.FetchPageWrite(sibling_id);
+		if (!sibling.has_value()) return std::unexpected(sibling.error());
+
+		// Validate now so ApplyDeletePlan can assert instead of check.
+		bool sibling_at_floor = false;
+		if (is_leaf) {
+			auto view = AsLeaf(sibling.value());
+			if (!view.has_value()) return std::unexpected(view.error());
+			sibling_at_floor = IsLeafAtFloor(view.value());
+		} else {
+			auto view = AsInternal(sibling.value());
+			if (!view.has_value()) return std::unexpected(view.error());
+			if (view->Level() != AsInternal(path.nodes[level]).value().Level()) {
+				return std::unexpected(Status::Corruption(
+				    "sibling page " + std::to_string(sibling_id) + " is at the wrong level"));
+			}
+			sibling_at_floor = IsInternalAtFloor(view.value());
+		}
+
+		// A sibling above its floor lends one entry; the parent loses nothing and the cascade ends.
+		if (!sibling_at_floor) {
+			plan.steps.push_back(DeleteStep{std::move(sibling.value()), sibling_is_left,
+			                                DeleteStep::Fix::kRedistribute});
+			return plan;
+		}
+
+		// Otherwise merge: the parent loses an entry, so ask the same question one level up.
+		plan.steps.push_back(
+		    DeleteStep{std::move(sibling.value()), sibling_is_left, DeleteStep::Fix::kMerge});
+	}
+
+	// Reached only if every level below the root merged, or the root is the leaf (no steps). An
+	// internal root losing one of its last two children is left with one: replace it by that child.
+	if (!plan.steps.empty()) {
+		plan.collapse_root = AsInternal(path.nodes[0]).value().Count() == 2;
+	}
+	return plan;
+}
+
+std::vector<page_id_t> BPlusTree::ApplyDeletePlan(WritePath& path, DeletePlan& plan) {
+	std::vector<page_id_t> to_free;
+	const std::size_t leaf_level = path.nodes.size() - 1;
+
+	for (std::size_t k = 0; k < plan.steps.size(); k++) {
+		DeleteStep& step = plan.steps[k];
+		const std::size_t level = leaf_level - k;
+
+		// Cannot fail: FindLeafWrite and PlanDelete validated every page used here.
+		auto parent = AsInternal(path.nodes[level - 1]).value();
+		const uint16_t child_index = path.child_indexes[level - 1];
+
+		// Put the pair in key order. right's slot in the parent is where the separator between
+		// them lives, and the slot a merge removes.
+		WritePageGuard& left_guard = step.sibling_is_left ? step.sibling : path.nodes[level];
+		WritePageGuard& right_guard = step.sibling_is_left ? path.nodes[level] : step.sibling;
+		const auto right_slot =
+		    static_cast<uint16_t>(step.sibling_is_left ? child_index : child_index + 1);
+		const index_key_t separator = parent.KeyAt(right_slot);
+
+		if (step.fix == DeleteStep::Fix::kRedistribute) {
+			// The sibling lends: a left sibling rotates right into the path node, a right sibling
+			// rotates left into it.
+			index_key_t new_separator;
+			if (k == 0) {
+				auto left = AsLeaf(left_guard).value();
+				auto right = AsLeaf(right_guard).value();
+				new_separator = step.sibling_is_left ? RotateLeafRight(left, right)
+				                                     : RotateLeafLeft(left, right);
+			} else {
+				auto left = AsInternal(left_guard).value();
+				auto right = AsInternal(right_guard).value();
+				new_separator = step.sibling_is_left ? RotateInternalRight(left, right, separator)
+				                                     : RotateInternalLeft(left, right, separator);
+			}
+			parent.SetKeyAt(right_slot, new_separator);
+
+			// A redistribute is always the last step.
+			assert(k + 1 == plan.steps.size());
+			break;
+		}
+
+		// Merge right into left — right is the path node itself when the sibling is on the left.
+		if (k == 0) {
+			MergeLeaf(AsLeaf(left_guard).value(), AsLeaf(right_guard).value());
+		} else {
+			MergeInternal(AsInternal(left_guard).value(), AsInternal(right_guard).value(),
+			              separator);
+		}
+		parent.RemoveAt(right_slot);
+		to_free.push_back(right_guard.PageId());
+	}
+
+	if (plan.collapse_root) {
+		auto root = AsInternal(path.nodes[0]).value();
+		assert(root.Count() == 1);
+
+		// The survivor of every merge is the left node, so the root's one child is child 0.
+		path.header.root_page_id = root.ChildAt(0);
+		path.header.height--;
+
+		// Header first, then the free: once the header points past it, nothing reaches the old
+		// root. Asserted rather than returned for the same reason as in Insert.
+		[[maybe_unused]] const Status s = WriteIndexHeader(path.header_guard, path.header);
+		assert(s.ok());
+		to_free.push_back(path.nodes[0].PageId());
+	}
+
+	return to_free;
+}
