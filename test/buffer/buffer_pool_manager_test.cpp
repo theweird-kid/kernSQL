@@ -1,6 +1,7 @@
 #include "buffer/buffer_pool_manager.hpp"
 
 #include <gtest/gtest.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <array>
@@ -41,7 +42,8 @@ class BufferPoolManagerTest : public ::testing::Test {
 	void SetUp() override {
 		path_ = std::filesystem::temp_directory_path() /
 		        (std::string("kernsql_bpm_test_") +
-		         testing::UnitTest::GetInstance()->current_test_info()->name());
+		         testing::UnitTest::GetInstance()->current_test_info()->name() + "_" +
+		         std::to_string(getpid()));
 		std::filesystem::remove(path_);  // in case a prior crashed run left it behind
 
 		auto dm = DiskManager::Open(path_);

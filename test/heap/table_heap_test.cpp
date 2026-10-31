@@ -1,6 +1,7 @@
 #include "heap/table_heap.hpp"
 
 #include <gtest/gtest.h>
+#include <unistd.h>
 
 #include <array>
 #include <atomic>
@@ -53,7 +54,8 @@ class TableHeapTest : public ::testing::Test {
 	void SetUp() override {
 		path_ = std::filesystem::temp_directory_path() /
 		        (std::string("kernsql_table_heap_test_") +
-		         testing::UnitTest::GetInstance()->current_test_info()->name());
+		         testing::UnitTest::GetInstance()->current_test_info()->name() + "_" +
+		         std::to_string(getpid()));
 		std::filesystem::remove(path_);
 
 		OpenPool();

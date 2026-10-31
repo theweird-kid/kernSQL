@@ -13,12 +13,12 @@
             "state": {
               "type": "markdown",
               "state": {
-                "file": "design-docs/DD-004-heap-pages-and-table-heap.md",
+                "file": "file:/home/gaurav29/c/programming/go/blobstore/PROJECT.md",
                 "mode": "preview",
                 "source": false
               },
               "icon": "lucide-file",
-              "title": "DD-004-heap-pages-and-table-heap"
+              "title": "PROJECT"
             }
           }
         ]
@@ -188,17 +188,19 @@
   },
   "active": "213624f19b44c94b",
   "lastOpenFiles": [
-    "test/heap/table_heap_test.cpp",
-    "test/heap/table_heap_test.cpp.tmp.18698.cd124d9f8f82",
-    "build/debug/lib/stSWVPH6",
-    "build/debug/lib/stX2r8JG",
-    "build/debug/lib/st86nMd7",
-    "build/debug/lib/stOHmJLK",
-    "build/debug/lib/stl0srJW",
-    "build/debug/lib/stiFWUPf",
-    "build/debug/lib/staf5uB5",
-    "build/debug/lib/stwxl6qH",
-    "build/debug/_deps/googletest-build/googletest/CMakeFiles/gtest.dir/src/gtest-all.cc.o.d",
+    "__cmake_systeminformation/AllMacros.txt",
+    "__cmake_systeminformation/results.txt",
+    "__cmake_systeminformation/CMakeFiles/4.3.0/CMakeCXXCompiler.cmake.tmp",
+    "__cmake_systeminformation/CMakeFiles/4.3.0/CMakeDetermineCompilerABI_CXX.bin",
+    "__cmake_systeminformation/CMakeFiles/CMakeScratch/TryCompile-S2shRO/cmTC_64442",
+    "__cmake_systeminformation/CMakeFiles/CMakeScratch/TryCompile-S2shRO/CMakeFiles/cmTC_64442.dir/CMakeCXXCompilerABI.cpp.o",
+    "__cmake_systeminformation/CMakeFiles/CMakeScratch/TryCompile-S2shRO/CMakeFiles/InstallScripts.json",
+    "__cmake_systeminformation/CMakeFiles/CMakeScratch/TryCompile-S2shRO/CMakeFiles/Makefile2",
+    "__cmake_systeminformation/CMakeFiles/CMakeScratch/TryCompile-S2shRO/CMakeFiles/progress.marks",
+    "__cmake_systeminformation/CMakeFiles/CMakeScratch/TryCompile-S2shRO/CMakeFiles/TargetDirectories.txt",
+    "__cmake_systeminformation/CMakeFiles/CMakeScratch/TryCompile-S2shRO/cmake_install.cmake",
+    "design-docs/DD-004-heap-pages-and-table-heap.md",
+    "design-docs/DD-005-b-plus-tree.md",
     "design-docs/DD-002-buffer-pool-manager.md",
     "design-docs/DD-003-threading-model.md",
     "design-docs/DD-002-buffer-manager.md",
