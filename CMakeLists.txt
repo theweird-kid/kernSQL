@@ -14,7 +14,8 @@ add_library(kernsql_lib STATIC
   src/heap/heap_page.cpp
   src/heap/table_heap.cpp
   src/indices/b_plus_tree.cpp
-  src/indices/b_plus_tree_page.cpp)
+  src/indices/b_plus_tree_page.cpp
+  src/catalog/schema.cpp)
 target_include_directories(kernsql_lib PUBLIC src)
 target_compile_options(kernsql_lib PUBLIC -Wall -Wextra -Wpedantic -Wshadow -Wconversion
   -Werror=format)
