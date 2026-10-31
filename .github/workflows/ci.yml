@@ -23,8 +23,14 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+      # Pinned to Fedora's clang-tools-extra version so local and CI formatting agree; apt's
+      # clang-format on ubuntu-24.04 is 18. Bump together with the dev machine.
       - run: |
-          sudo apt-get update && sudo apt-get install -y clang-format
+          python3 -m venv "$RUNNER_TEMP/clang-format"
+          "$RUNNER_TEMP/clang-format/bin/pip" install --quiet clang-format==22.1.8
+          echo "$RUNNER_TEMP/clang-format/bin" >> "$GITHUB_PATH"
+      - run: |
+          clang-format --version
           find src test -name '*.cpp' -o -name '*.h' | xargs clang-format --dry-run --Werror
   source-list:
     runs-on: ubuntu-24.04

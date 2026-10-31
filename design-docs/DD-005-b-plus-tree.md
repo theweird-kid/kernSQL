@@ -1,8 +1,8 @@
 # B+tree Index
 
-**Status:** Accepted. Phase 1 — search, insert and range scan — implemented and tested.
-Phase 2 — delete: redistribute, merge, root collapse — design settled 2026-10-20 (all-or-nothing
-via a read-only planning pass), not yet implemented.
+**Status:** Accepted. Implemented and tested. Phase 1 — search, insert and range scan. Phase 2 —
+delete: redistribute, merge, root collapse, all-or-nothing via a read-only planning pass
+(2026-10-20; tests 2026-10-31).
 **Component:** `src/indices` (`BPlusTree`, `IndexIterator` in `b_plus_tree.hpp`; node views in `b_plus_tree_page.hpp`)
 
 The primary-key index. Maps a unique `int64` key to the `RID` of the row that holds it, so that
@@ -358,8 +358,8 @@ leak, not an error (see [below](#a-failed-free-is-a-leak-not-an-error)).
 
 The plan and the apply must make the same decisions, so they read the same counts: the plan
 assumes exactly one entry leaves each level it visits, and that is exactly what the apply does.
-A `CheckInvariants()` after every delete in the differential test is what catches the two
-drifting apart.
+`CheckInvariants()` in the differential test — every 10th operation, and after every delete in
+the hand-written cases — is what catches the two drifting apart.
 
 **Always merge right into left.** Whichever of the two nodes underflowed, the survivor is the left
 one and the right one is freed. One code path, one direction, and the leaf chain only ever loses
@@ -485,9 +485,11 @@ lockstep; every result must match, and `CheckInvariants()` runs at a fixed inter
 times over. The seed goes into a `SCOPED_TRACE`, so any failure reproduces exactly from its
 output. This one test finds more tree bugs than every hand-written case combined.
 
-As built (phase 1, `test/indices/b_plus_tree_differential_test.cpp`): inserts, point lookups and
-short range scans, no deletes yet; 2000 operations per run over five fanout pairs — 3/3, 4/4, 3/5,
-5/3 and `NODE_CAPACITY` — and five seeds, then a reopen and the full comparison again from disk.
+As built (`test/indices/b_plus_tree_differential_test.cpp`): 2000 operations per run — 50%
+inserts, 20% deletes, 20% point lookups, 10% short range scans — over five fanout pairs — 3/3, 4/4,
+3/5, 5/3 and `NODE_CAPACITY` — and five seeds, then a reopen and the full comparison again from
+disk, then every remaining key deleted in random order down to one empty root leaf, with the
+free-list leak check below.
 `CheckInvariants()` runs every 10th operation rather than every one: it walks the whole tree, and
 at every operation it dominated the run time (~13 s per run under ASan). A structural failure is
 therefore caught within 10 operations of its cause; set the interval to 1 and replay the seed to
@@ -499,15 +501,24 @@ Around it, the targeted cases:
 - delete everything, in each order, until the tree is back to one empty root leaf — and then
   assert on the **file**: `PageCount()` never shrinks, but every page the tree freed must be back
   on the free list, so `PageCount()` minus the free-list length must equal the reserved pages plus
-  the header and the root. The same leak-detection idea as the heap's chain-extension test; it
-  needs a test-visible free-list length on `DiskManager`;
+  the header and the root. The same leak-detection idea as the heap's chain-extension test. As
+  built it needs no new `DiskManager` API: `NewPage` hands out free pages before it extends the
+  file, so the tests count the free list by calling `NewPage` until an id comes off the end;
 - a reopen test: build, `Shutdown`, reopen from the header page id, and replay the differential
   comparison against the saved `std::map`;
 - boundary keys: `INT64_MIN`, `INT64_MAX`, and ranges that start or end there;
 - delete fault injection: pin enough frames that a sibling fetch in the planning pass fails, and
   assert the error comes back with the tree's pages byte-for-byte unchanged and the key still
   found — the delete counterpart of insert's allocation-failure test;
-- the frame budget: a height-4 tree still works in a pool of exactly `2H + 2` frames.
+- the frame budget: a height-4 tree still works in a pool of exactly `2H + 2` frames. **Not yet
+  written** — the fault-injection tests pin to `1 + H` plus 0 or 1 spare frames, which covers the
+  failure side but not this success side.
+
+As built, the hand-written delete cases (`b_plus_tree_test.cpp`) assert the WHOLE shape, level by
+level, after each borrow, merge, internal rotation, cascade and root collapse — a borrow and a
+merge can leave the same keys in different nodes, so key lists alone don't tell them apart. The
+six rotate/merge helpers have byte-array tests in `b_plus_tree_page_test.cpp`, including an
+internal rotate-right-then-left round trip that must be byte-identical.
 
 ## Concurrency
 

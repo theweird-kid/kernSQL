@@ -1,6 +1,7 @@
 #include "heap/heap_page.hpp"
 
 #include <gtest/gtest.h>
+#include <unistd.h>
 
 #include <array>
 #include <cstddef>
@@ -13,8 +14,6 @@
 #include <string>
 #include <string_view>
 #include <vector>
-
-#include <unistd.h>
 
 #include "buffer/buffer_pool_manager.hpp"
 #include "buffer/page_guard.hpp"

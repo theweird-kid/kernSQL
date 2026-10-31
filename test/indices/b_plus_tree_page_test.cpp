@@ -1,6 +1,7 @@
 #include "indices/b_plus_tree_page.hpp"
 
 #include <gtest/gtest.h>
+#include <unistd.h>
 
 #include <array>
 #include <cstddef>
@@ -8,11 +9,10 @@
 #include <cstring>
 #include <filesystem>
 #include <optional>
+#include <span>
+#include <string>
 #include <utility>
 #include <vector>
-#include <string>
-
-#include <unistd.h>
 
 #include "buffer/buffer_pool_manager.hpp"
 #include "buffer/page_guard.hpp"
@@ -1055,6 +1055,306 @@ TEST_F(BPlusTreePageTest, SplitInternalAtCapacityLeavesBothHalvesCanonical) {
 }
 
 // ---------------------------------------------------------------------------------------------
+// RotateLeafRight / RotateLeafLeft — one entry moves between leaf siblings
+//
+// body_ is always `left` and right_body_ `right`, in key order, whichever of them underflowed.
+// ---------------------------------------------------------------------------------------------
+
+// Left's last entry becomes right's first, and that key is the new separator.
+TEST_F(BPlusTreePageTest, RotateLeafRightMovesLeftsLastEntry) {
+	auto left = Leaf();
+	left.Init();
+	left.Assign(LeafEntries(3));  // 10 20 30
+	auto right = RightLeaf();
+	right.Init();
+	right.Assign(std::vector<LeafEntry>{{40, RID{3, 0}}});
+
+	const index_key_t sep = RotateLeafRight(left, right);
+
+	const std::vector<LeafEntry> want_left{{10, RID{2, 0}}, {20, RID{2, 1}}};
+	const std::vector<LeafEntry> want_right{{30, RID{2, 2}}, {40, RID{3, 0}}};
+	EXPECT_EQ(EntriesOf(left), want_left);
+	EXPECT_EQ(EntriesOf(right), want_right);
+	EXPECT_EQ(sep, 30);
+	EXPECT_EQ(FirstNonZeroByte(body_, NodeEntryOffset(left.Count())), std::nullopt);
+	EXPECT_EQ(FirstNonZeroByte(right_body_, NodeEntryOffset(right.Count())), std::nullopt);
+}
+
+// At leaf_max 3 the floor is 1, so the leaf that underflowed is EMPTY when it borrows.
+TEST_F(BPlusTreePageTest, RotateLeafRightIntoAnEmptyLeaf) {
+	auto left = Leaf();
+	left.Init();
+	left.Assign(LeafEntries(2));  // 10 20
+	auto right = RightLeaf();
+	right.Init();
+
+	const index_key_t sep = RotateLeafRight(left, right);
+
+	EXPECT_EQ(EntriesOf(left), (std::vector<LeafEntry>{{10, RID{2, 0}}}));
+	EXPECT_EQ(EntriesOf(right), (std::vector<LeafEntry>{{20, RID{2, 1}}}));
+	EXPECT_EQ(sep, 20);
+}
+
+// Right's first entry is appended to left. The separator is right's NEW first key, not the key
+// that moved — that one now lives in left, below the separator.
+TEST_F(BPlusTreePageTest, RotateLeafLeftReturnsRightsNewFirstKey) {
+	auto left = Leaf();
+	left.Init();
+	left.Assign(std::vector<LeafEntry>{{5, RID{3, 0}}});
+	auto right = RightLeaf();
+	right.Init();
+	right.Assign(LeafEntries(3));  // 10 20 30
+
+	const index_key_t sep = RotateLeafLeft(left, right);
+
+	const std::vector<LeafEntry> want_left{{5, RID{3, 0}}, {10, RID{2, 0}}};
+	const std::vector<LeafEntry> want_right{{20, RID{2, 1}}, {30, RID{2, 2}}};
+	EXPECT_EQ(EntriesOf(left), want_left);
+	EXPECT_EQ(EntriesOf(right), want_right);
+	EXPECT_EQ(sep, 20);
+	EXPECT_EQ(FirstNonZeroByte(body_, NodeEntryOffset(left.Count())), std::nullopt);
+	EXPECT_EQ(FirstNonZeroByte(right_body_, NodeEntryOffset(right.Count())), std::nullopt);
+}
+
+TEST_F(BPlusTreePageTest, RotateLeafLeftIntoAnEmptyLeaf) {
+	auto left = Leaf();
+	left.Init();
+	auto right = RightLeaf();
+	right.Init();
+	right.Assign(LeafEntries(2));  // 10 20
+
+	const index_key_t sep = RotateLeafLeft(left, right);
+
+	EXPECT_EQ(EntriesOf(left), (std::vector<LeafEntry>{{10, RID{2, 0}}}));
+	EXPECT_EQ(EntriesOf(right), (std::vector<LeafEntry>{{20, RID{2, 1}}}));
+	EXPECT_EQ(sep, 20);
+}
+
+// A rotation moves an entry, not a link: both NextLeaf values, and both levels, are untouched.
+TEST_F(BPlusTreePageTest, LeafRotationsLeaveTheChainAlone) {
+	auto left = Leaf();
+	left.Init();
+	left.Assign(LeafEntries(3));
+	left.SetNextLeaf(7);
+	auto right = RightLeaf();
+	right.Init();
+	right.Assign(std::vector<LeafEntry>{{40, RID{3, 0}}});
+	right.SetNextLeaf(42);
+
+	(void)RotateLeafRight(left, right);
+	EXPECT_EQ(left.NextLeaf(), 7);
+	EXPECT_EQ(right.NextLeaf(), 42);
+
+	(void)RotateLeafLeft(left, right);
+	EXPECT_EQ(left.NextLeaf(), 7);
+	EXPECT_EQ(right.NextLeaf(), 42);
+
+	EXPECT_EQ(left.Header().level, 0);
+	EXPECT_EQ(right.Header().level, 0);
+	EXPECT_TRUE(left.CheckInvariants());
+	EXPECT_TRUE(right.CheckInvariants());
+}
+
+// ---------------------------------------------------------------------------------------------
+// RotateInternalRight / RotateInternalLeft — a rotation THROUGH the parent
+//
+// The parent's separator between the two comes down; a key from the lender goes up.
+// ---------------------------------------------------------------------------------------------
+
+// Left [MIN,2] [10,3] [20,4], parent separator 30, right [MIN,5] [40,6]. Left's last child (4)
+// moves to right's front; 30 comes down in front of right's old first child (5); 20 goes up.
+TEST_F(BPlusTreePageTest, RotateInternalRightBringsTheSeparatorDown) {
+	auto left = Internal();
+	left.Init(1);
+	left.Assign(InternalEntries(3));
+	auto right = RightInternal();
+	right.Init(1);
+	right.Assign(std::vector<InternalEntry>{{0, 5}, {40, 6}});
+
+	const index_key_t up = RotateInternalRight(left, right, 30);
+
+	const std::vector<InternalEntry> want_left{{INT64_MIN, 2}, {10, 3}};
+	const std::vector<InternalEntry> want_right{{INT64_MIN, 4}, {30, 5}, {40, 6}};
+	EXPECT_EQ(EntriesOf(left), want_left);
+	EXPECT_EQ(EntriesOf(right), want_right);
+	EXPECT_EQ(up, 20);
+	EXPECT_TRUE(left.CheckInvariants());
+	EXPECT_TRUE(right.CheckInvariants());
+	EXPECT_EQ(FirstNonZeroByte(body_, NodeEntryOffset(left.Count())), std::nullopt);
+	EXPECT_EQ(FirstNonZeroByte(right_body_, NodeEntryOffset(right.Count())), std::nullopt);
+}
+
+// The mirror. Left [MIN,2] [10,3], separator 20, right [MIN,4] [30,5] [40,6]. Right's first
+// child (4) moves to left's end behind the separator 20; right's KeyAt(1) = 30 goes up, and its
+// slot becomes right's INT64_MIN entry[0].
+TEST_F(BPlusTreePageTest, RotateInternalLeftSendsRightsFirstSeparatorUp) {
+	auto left = Internal();
+	left.Init(1);
+	left.Assign(InternalEntries(2));
+	auto right = RightInternal();
+	right.Init(1);
+	right.Assign(std::vector<InternalEntry>{{0, 4}, {30, 5}, {40, 6}});
+
+	const index_key_t up = RotateInternalLeft(left, right, 20);
+
+	const std::vector<InternalEntry> want_left{{INT64_MIN, 2}, {10, 3}, {20, 4}};
+	const std::vector<InternalEntry> want_right{{INT64_MIN, 5}, {40, 6}};
+	EXPECT_EQ(EntriesOf(left), want_left);
+	EXPECT_EQ(EntriesOf(right), want_right);
+	EXPECT_EQ(up, 30);
+	EXPECT_TRUE(left.CheckInvariants());
+	EXPECT_TRUE(right.CheckInvariants());
+	EXPECT_EQ(FirstNonZeroByte(body_, NodeEntryOffset(left.Count())), std::nullopt);
+	EXPECT_EQ(FirstNonZeroByte(right_body_, NodeEntryOffset(right.Count())), std::nullopt);
+}
+
+// Right then left, feeding each returned key back in as the separator, is the identity: both
+// nodes byte-identical to where they started. Catches an off-by-one that the two single-step
+// tests above would each mirror consistently.
+TEST_F(BPlusTreePageTest, InternalRotationsRoundTripByteIdentical) {
+	auto left = Internal();
+	left.Init(2);
+	left.Assign(InternalEntries(3));
+	auto right = RightInternal();
+	right.Init(2);
+	right.Assign(std::vector<InternalEntry>{{0, 5}, {40, 6}});
+	const auto left_before = body_;
+	const auto right_before = right_body_;
+
+	const index_key_t up = RotateInternalRight(left, right, 30);
+	const index_key_t back = RotateInternalLeft(left, right, up);
+
+	EXPECT_EQ(back, 30);
+	EXPECT_EQ(body_, left_before);
+	EXPECT_EQ(right_body_, right_before);
+}
+
+// ---------------------------------------------------------------------------------------------
+// MergeLeaf / MergeInternal — right into left; right is left as it was
+// ---------------------------------------------------------------------------------------------
+
+// Left gets every entry, in order, and right's NextLeaf — otherwise the chain would point at the
+// page about to be freed. Right's bytes are not touched.
+TEST_F(BPlusTreePageTest, MergeLeafAppendsAndTakesRightsLink) {
+	auto left = Leaf();
+	left.Init();
+	left.Assign(LeafEntries(2));  // 10 20
+	left.SetNextLeaf(7);
+	auto right = RightLeaf();
+	right.Init();
+	right.Assign(std::vector<LeafEntry>{{30, RID{3, 0}}, {40, RID{3, 1}}});
+	right.SetNextLeaf(42);
+	const auto right_before = right_body_;
+
+	MergeLeaf(left, right);
+
+	const std::vector<LeafEntry> want{
+	    {10, RID{2, 0}}, {20, RID{2, 1}}, {30, RID{3, 0}}, {40, RID{3, 1}}};
+	EXPECT_EQ(EntriesOf(left), want);
+	EXPECT_EQ(left.NextLeaf(), 42);
+	EXPECT_EQ(right_body_, right_before);
+	EXPECT_TRUE(left.CheckInvariants());
+	EXPECT_EQ(FirstNonZeroByte(body_, NodeEntryOffset(left.Count())), std::nullopt);
+}
+
+// Either side may be empty — again leaf_max 3, floor 1. Also with right at the end of the chain.
+TEST_F(BPlusTreePageTest, MergeLeafWithAnEmptySide) {
+	for (const bool left_empty : {true, false}) {
+		SCOPED_TRACE(left_empty ? "left empty" : "right empty");
+		body_.fill(std::byte{0});
+		right_body_.fill(std::byte{0});
+		auto left = Leaf();
+		left.Init();
+		left.SetNextLeaf(7);
+		auto right = RightLeaf();
+		right.Init();
+		(left_empty ? right : left).Assign(LeafEntries(2));
+
+		MergeLeaf(left, right);
+
+		EXPECT_EQ(EntriesOf(left), LeafEntries(2));
+		EXPECT_EQ(left.NextLeaf(), INVALID_PAGE);
+	}
+}
+
+// Exactly NODE_CAPACITY entries after the merge: fits, every key in order, canonical.
+TEST_F(BPlusTreePageTest, MergeLeafToExactlyCapacity) {
+	const auto all = LeafEntries(NODE_CAPACITY);
+	constexpr uint16_t kLeft = NODE_CAPACITY / 2;
+	auto left = Leaf();
+	left.Init();
+	left.Assign(std::span(all).first(kLeft));
+	auto right = RightLeaf();
+	right.Init();
+	right.Assign(std::span(all).subspan(kLeft));
+
+	MergeLeaf(left, right);
+
+	EXPECT_EQ(EntriesOf(left), all);
+	EXPECT_TRUE(left.CheckInvariants());
+}
+
+// Left [MIN,2] [10,3], separator 20, right [MIN,4] [30,5]: left becomes all four children, with
+// 20 in front of right's old first child. Right untouched; the level kept.
+TEST_F(BPlusTreePageTest, MergeInternalBringsTheSeparatorDown) {
+	auto left = Internal();
+	left.Init(2);
+	left.Assign(InternalEntries(2));
+	auto right = RightInternal();
+	right.Init(2);
+	right.Assign(std::vector<InternalEntry>{{0, 4}, {30, 5}});
+	const auto right_before = right_body_;
+
+	MergeInternal(left, right, 20);
+
+	const std::vector<InternalEntry> want{{INT64_MIN, 2}, {10, 3}, {20, 4}, {30, 5}};
+	EXPECT_EQ(EntriesOf(left), want);
+	EXPECT_EQ(left.Level(), 2);
+	EXPECT_EQ(right_body_, right_before);
+	EXPECT_TRUE(left.CheckInvariants());
+	EXPECT_EQ(FirstNonZeroByte(body_, NodeEntryOffset(left.Count())), std::nullopt);
+}
+
+// The smallest legal merge: one child each, two after. The separator is the only key left holds.
+TEST_F(BPlusTreePageTest, MergeInternalOfTwoSingleChildNodes) {
+	auto left = Internal();
+	left.Init(1);
+	left.Assign(std::vector<InternalEntry>{{0, 2}});
+	auto right = RightInternal();
+	right.Init(1);
+	right.Assign(std::vector<InternalEntry>{{0, 3}});
+
+	MergeInternal(left, right, 50);
+
+	EXPECT_EQ(EntriesOf(left), (std::vector<InternalEntry>{{INT64_MIN, 2}, {50, 3}}));
+	EXPECT_TRUE(left.CheckInvariants());
+}
+
+// Exactly NODE_CAPACITY children after the merge: every child once, in order, and the separator
+// at the seam.
+TEST_F(BPlusTreePageTest, MergeInternalToExactlyCapacity) {
+	const auto all = InternalEntries(NODE_CAPACITY);  // children 2 .. 254, keys 0 .. 2520
+	constexpr uint16_t kLeft = NODE_CAPACITY / 2;
+	auto left = Internal();
+	left.Init(1);
+	left.Assign(std::span(all).first(kLeft));
+	auto right = RightInternal();
+	right.Init(1);
+	right.Assign(std::span(all).subspan(kLeft));
+
+	MergeInternal(left, right, all[kLeft].key);
+
+	ASSERT_EQ(left.Count(), NODE_CAPACITY);
+	for (uint16_t i = 0; i < NODE_CAPACITY; ++i) {
+		EXPECT_EQ(left.ChildAt(i), all[i].child) << "child " << i;
+		if (i > 0) {
+			EXPECT_EQ(left.KeyAt(i), all[i].key) << "key " << i;
+		}
+	}
+	EXPECT_TRUE(left.CheckInvariants());
+}
+
+// ---------------------------------------------------------------------------------------------
 // IndexHeader on a bare body
 // ---------------------------------------------------------------------------------------------
 
@@ -1229,8 +1529,9 @@ TEST_F(BPlusTreePageTest, WriteIndexHeaderRejectsANonHeaderPageWithoutWriting) {
 // Write, Shutdown, reopen, read back: survives a trip through disk, not just the frame.
 TEST_F(BPlusTreePageTest, IndexHeaderSurvivesFlushAndReopen) {
 	// By hand rather than WithBufferPool: the file has to be closed and opened again mid-test.
-	const auto path = std::filesystem::temp_directory_path() /
-	                  (std::string("kernsql_bptree_header_reopen_test_") + std::to_string(getpid()));
+	const auto path =
+	    std::filesystem::temp_directory_path() /
+	    (std::string("kernsql_bptree_header_reopen_test_") + std::to_string(getpid()));
 	std::filesystem::remove(path);
 
 	// Every field off its default and distinct from the others, so neither an unwritten field nor

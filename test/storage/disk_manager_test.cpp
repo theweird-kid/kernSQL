@@ -11,9 +11,9 @@
 #include <filesystem>
 #include <set>
 #include <span>
+#include <string>
 #include <thread>
 #include <vector>
-#include <string>
 
 #include "common/page_header.hpp"
 #include "common/status.hpp"
@@ -25,8 +25,8 @@ class DiskManagerTest : public ::testing::Test {
 	void SetUp() override {
 		path_ = std::filesystem::temp_directory_path() /
 		        (std::string("kernsql_test_") +
-		         testing::UnitTest::GetInstance()->current_test_info()->name() +
-		         "_" + std::to_string(getpid()));
+		         testing::UnitTest::GetInstance()->current_test_info()->name() + "_" +
+		         std::to_string(getpid()));
 		std::filesystem::remove(path_);  // in case a prior crashed run left it behind
 	}
 	void TearDown() override { std::filesystem::remove(path_); }

@@ -1,11 +1,13 @@
 #include "indices/b_plus_tree.hpp"
 
 #include <gtest/gtest.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <cstdint>
 #include <filesystem>
 #include <functional>
+#include <iterator>
 #include <map>
 #include <memory>
 #include <numeric>
@@ -14,8 +16,6 @@
 #include <string>
 #include <utility>
 #include <vector>
-
-#include <unistd.h>
 
 #include "buffer/buffer_pool_manager.hpp"
 #include "buffer/page_guard.hpp"
@@ -27,7 +27,8 @@
 namespace kernsql {
 
 /*
- * BPlusTree's Insert, read path and IndexIterator, against a real file and a real buffer pool.
+ * BPlusTree's Insert, Delete, read path and IndexIterator, against a real file and a real
+ * buffer pool.
  *
  * A test not written yet is GTEST_SKIP rather than an empty body, so it shows up as skipped in
  * ctest instead of passing silently.
@@ -215,6 +216,111 @@ class BPlusTreeTest : public ::testing::Test {
 			for (uint16_t i = 0; i < leaf->Count(); ++i) keys.push_back(leaf->KeyAt(i));
 		}
 		return out;
+	}
+
+	// The tree level by level, root first; each node as its keys — an internal node's separators
+	// (KeyAt(1 ..)), a leaf's entries. One comparison pins the whole shape, which is what the
+	// Delete tests need: a borrow and a merge can leave the same keys in different nodes.
+	std::vector<std::vector<std::vector<index_key_t>>> Levels() {
+		std::vector<std::vector<std::vector<index_key_t>>> out;
+		std::vector<page_id_t> level_pages{ReadHeader().root_page_id};
+		while (!level_pages.empty()) {
+			std::vector<page_id_t> next;
+			auto& level = out.emplace_back();
+			for (const page_id_t id : level_pages) {
+				auto guard = bpm_->FetchPageRead(id);
+				if (!guard.has_value()) {
+					ADD_FAILURE() << guard.error().message();
+					return out;
+				}
+				auto& keys = level.emplace_back();
+				if (auto leaf = AsLeaf(guard.value()); leaf.has_value()) {
+					for (uint16_t i = 0; i < leaf->Count(); ++i) keys.push_back(leaf->KeyAt(i));
+					continue;
+				}
+				auto node = AsInternal(guard.value());
+				if (!node.has_value()) {
+					ADD_FAILURE() << node.error().message();
+					return out;
+				}
+				for (uint16_t i = 0; i < node->Count(); ++i) {
+					if (i > 0) keys.push_back(node->KeyAt(i));
+					next.push_back(node->ChildAt(i));
+				}
+			}
+			level_pages = std::move(next);
+		}
+		return out;
+	}
+
+	// Every page the tree owns: the header and every node reachable from the root.
+	std::vector<page_id_t> TreePages() {
+		std::vector<page_id_t> pages{tree_->HeaderPageId()};
+		std::vector<page_id_t> frontier{ReadHeader().root_page_id};
+		while (!frontier.empty()) {
+			const page_id_t id = frontier.back();
+			frontier.pop_back();
+			pages.push_back(id);
+			auto guard = bpm_->FetchPageRead(id);
+			if (!guard.has_value()) {
+				ADD_FAILURE() << guard.error().message();
+				return pages;
+			}
+			if (auto node = AsInternal(guard.value()); node.has_value()) {
+				for (uint16_t i = 0; i < node->Count(); ++i) frontier.push_back(node->ChildAt(i));
+			}
+		}
+		std::ranges::sort(pages);
+		return pages;
+	}
+
+	// The body bytes of every page the tree owns — "byte-for-byte unchanged" in one comparison.
+	std::map<page_id_t, std::vector<std::byte>> TreeBytes() {
+		std::map<page_id_t, std::vector<std::byte>> out;
+		for (const page_id_t id : TreePages()) {
+			auto guard = bpm_->FetchPageRead(id);
+			if (!guard.has_value()) {
+				ADD_FAILURE() << guard.error().message();
+				continue;
+			}
+			const auto body = guard->Body();
+			out[id] = std::vector<std::byte>(body.begin(), body.end());
+		}
+		return out;
+	}
+
+	// The page ids on the free list: NewPage until one comes off the end of the file instead.
+	// Each probe is given back with DeletePage, so the list ends as it began and only the file
+	// has grown by one page. Order-free, so callers compare sets.
+	std::set<page_id_t> FreePages() {
+		std::set<page_id_t> free;
+		std::vector<page_id_t> probed;
+		const page_id_t end = dm_->PageCount();
+		for (;;) {
+			page_id_t id = INVALID_PAGE;
+			{
+				auto guard = bpm_->NewPage();
+				if (!guard.has_value()) {
+					ADD_FAILURE() << guard.error().message();
+					break;
+				}
+				id = guard->PageId();
+			}
+			probed.push_back(id);
+			if (id >= end) break;
+			free.insert(id);
+		}
+		for (const page_id_t id : probed) EXPECT_TRUE(bpm_->DeletePage(id).ok()) << id;
+		return free;
+	}
+
+	// Delete each key, in order, and check the whole tree after every one.
+	void DeleteAll(const std::vector<index_key_t>& keys) {
+		for (const index_key_t key : keys) {
+			const Status s = tree_->Delete(key);
+			ASSERT_TRUE(s.ok()) << "key " << key << ": " << s.message();
+			ASSERT_TRUE(tree_->CheckInvariants()) << "after deleting " << key;
+		}
 	}
 
 	// The reference layout the Scan tests are written against, at MIN_FANOUT:
@@ -667,6 +773,347 @@ TEST_F(BPlusTreeTest, InsertThatCannotAllocateLeavesTheTreeUntouched) {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Delete
+//
+// At MIN_FANOUT a non-root leaf's floor is 1 entry and an internal node's is 2 children, so a
+// leaf with one entry and an internal node with two children are "at the floor": the next loss
+// underflows them, and as siblings they cannot lend. Shapes are asserted whole with Levels(),
+// because a borrow and a merge can leave the same keys in different nodes.
+// ---------------------------------------------------------------------------------------------
+
+using Shape = std::vector<std::vector<std::vector<index_key_t>>>;
+
+// A root leaf has no floor and no sibling: it shrinks, down to empty, and nothing else changes.
+TEST_F(BPlusTreeTest, DeleteFromTheRootLeafNeedsNoSibling) {
+	ASSERT_NO_FATAL_FAILURE(InsertAll({10, 20, 30}));
+	const page_id_t root = ReadHeader().root_page_id;
+	const page_id_t pages = dm_->PageCount();
+
+	ASSERT_NO_FATAL_FAILURE(DeleteAll({20}));
+	EXPECT_EQ(Levels(), (Shape{{{10, 30}}}));
+
+	ASSERT_NO_FATAL_FAILURE(DeleteAll({10, 30}));
+	EXPECT_EQ(Levels(), (Shape{{{}}}));
+	EXPECT_EQ(Height(), 1);
+	EXPECT_EQ(ReadHeader().root_page_id, root);
+	EXPECT_EQ(dm_->PageCount(), pages);
+	EXPECT_EQ(CollectScan(INT64_MIN, INT64_MAX), WithRids({}));
+}
+
+// An absent key is kNotFound and changes nothing — not even in a leaf at its floor, where a
+// planner that ran before the presence check would already be fetching siblings. Also on an
+// empty tree, and at both ends of the domain.
+TEST_F(BPlusTreeTest, DeleteOfAnAbsentKeyIsNotFoundAndChangesNothing) {
+	{
+		const Status s = tree_->Delete(1);
+		EXPECT_EQ(s.code(), ErrorCode::kNotFound) << s.message();
+	}
+
+	ASSERT_NO_FATAL_FAILURE(BuildReferenceTree());
+	ASSERT_NO_FATAL_FAILURE(DeleteAll({25}));  // leaf 20 is now at its floor
+	const auto bytes = TreeBytes();
+
+	for (const index_key_t key : {index_key_t{4}, index_key_t{8}, index_key_t{21}, index_key_t{25},
+	                              index_key_t{30}, INT64_MIN, INT64_MAX}) {
+		SCOPED_TRACE(testing::Message() << "key " << key);
+		const Status s = tree_->Delete(key);
+		EXPECT_EQ(s.code(), ErrorCode::kNotFound) << s.message();
+	}
+
+	EXPECT_EQ(TreeBytes(), bytes);
+	EXPECT_TRUE(tree_->CheckInvariants());
+}
+
+// Above the floor nothing but the leaf changes — and the separators stay even when the key they
+// were copied from is deleted: 10 is gone from the leaves but still routes in the root.
+TEST_F(BPlusTreeTest, DeleteAboveTheFloorLeavesSeparatorsAlone) {
+	ASSERT_NO_FATAL_FAILURE(BuildReferenceTree());
+	const auto leaves = LeafPages();
+
+	ASSERT_NO_FATAL_FAILURE(DeleteAll({5, 10}));
+
+	EXPECT_EQ(Levels(), (Shape{{{10, 20}}, {{3, 7}, {12, 15}, {20, 25}}}));
+	EXPECT_EQ(LeafPages(), leaves);
+
+	auto gone = tree_->Get(10);
+	ASSERT_FALSE(gone.has_value());
+	EXPECT_EQ(gone.error().code(), ErrorCode::kNotFound);
+	EXPECT_EQ(CollectScan(10, 10), WithRids({}));
+	EXPECT_EQ(CollectScan(INT64_MIN, INT64_MAX), WithRids({3, 7, 12, 15, 20, 25}));
+}
+
+// The rightmost leaf underflows and its LEFT sibling lends its last entry. The separator between
+// them becomes the moved key. No page is allocated or freed.
+TEST_F(BPlusTreeTest, DeleteBorrowsFromTheLeftLeaf) {
+	ASSERT_NO_FATAL_FAILURE(BuildReferenceTree());
+	const auto leaves = LeafPages();
+
+	ASSERT_NO_FATAL_FAILURE(DeleteAll({20, 25}));
+
+	EXPECT_EQ(Levels(), (Shape{{{10, 15}}, {{3, 5, 7}, {10, 12}, {15}}}));
+	EXPECT_EQ(LeafPages(), leaves);
+	EXPECT_EQ(FreePages(), std::set<page_id_t>{});
+	EXPECT_EQ(CollectScan(INT64_MIN, INT64_MAX), WithRids({3, 5, 7, 10, 12, 15}));
+}
+
+// The LEFTMOST leaf has no left sibling, so it borrows from the right. The new separator is the
+// right leaf's new first key, not the key that moved.
+TEST_F(BPlusTreeTest, DeleteBorrowsFromTheRightLeafWhenLeftmost) {
+	ASSERT_NO_FATAL_FAILURE(BuildReferenceTree());
+	const auto leaves = LeafPages();
+
+	ASSERT_NO_FATAL_FAILURE(DeleteAll({3, 5, 7}));
+
+	EXPECT_EQ(Levels(), (Shape{{{12, 20}}, {{10}, {12, 15}, {20, 25}}}));
+	EXPECT_EQ(LeafPages(), leaves);
+	EXPECT_EQ(CollectScan(INT64_MIN, INT64_MAX), WithRids({10, 12, 15, 20, 25}));
+}
+
+// Both leaves at the floor: the underflowing one (the right) merges INTO its left sibling, the
+// parent drops the separator between them, and the right page goes on the free list. The left
+// leaf takes over the end of the chain.
+TEST_F(BPlusTreeTest, DeleteMergesIntoTheLeftLeafAndFreesTheRight) {
+	ASSERT_NO_FATAL_FAILURE(BuildReferenceTree());
+	ASSERT_NO_FATAL_FAILURE(DeleteAll({12, 15, 25}));
+	ASSERT_EQ(Levels(), (Shape{{{10, 20}}, {{3, 5, 7}, {10}, {20}}}));
+	const auto leaves = LeafPages();
+
+	ASSERT_NO_FATAL_FAILURE(DeleteAll({20}));
+
+	EXPECT_EQ(Levels(), (Shape{{{10}}, {{3, 5, 7}, {10}}}));
+	EXPECT_EQ(LeafPages(), (std::vector<page_id_t>{leaves[0], leaves[1]}));
+	EXPECT_EQ(FreePages(), std::set<page_id_t>{leaves[2]});
+	EXPECT_EQ(CollectScan(INT64_MIN, INT64_MAX), WithRids({3, 5, 7, 10}));
+}
+
+// The leftmost leaf underflows with a right sibling at the floor: the merge still goes right
+// into left, so the LEFTMOST page survives — holding the right sibling's keys — and the right
+// page is freed.
+TEST_F(BPlusTreeTest, DeleteMergesTheRightLeafIntoTheLeftmost) {
+	ASSERT_NO_FATAL_FAILURE(BuildReferenceTree());
+	ASSERT_NO_FATAL_FAILURE(DeleteAll({5, 7, 12, 15}));
+	ASSERT_EQ(Levels(), (Shape{{{10, 20}}, {{3}, {10}, {20, 25}}}));
+	const auto leaves = LeafPages();
+
+	ASSERT_NO_FATAL_FAILURE(DeleteAll({3}));
+
+	EXPECT_EQ(Levels(), (Shape{{{20}}, {{10}, {20, 25}}}));
+	EXPECT_EQ(LeafPages(), (std::vector<page_id_t>{leaves[0], leaves[2]}));
+	EXPECT_EQ(FreePages(), std::set<page_id_t>{leaves[1]});
+}
+
+// A merge that leaves an internal root with one child: the child becomes the root, the header
+// says so, the height drops, and both the old root and the merged-away leaf are freed.
+TEST_F(BPlusTreeTest, DeleteCollapsesARootLeftWithOneChild) {
+	ASSERT_NO_FATAL_FAILURE(InsertAll({1, 2, 3, 4}));
+	ASSERT_NO_FATAL_FAILURE(DeleteAll({1, 4}));
+	ASSERT_EQ(Levels(), (Shape{{{3}}, {{2}, {3}}}));
+	const page_id_t old_root = ReadHeader().root_page_id;
+	const auto leaves = LeafPages();
+
+	ASSERT_NO_FATAL_FAILURE(DeleteAll({3}));
+
+	const IndexHeader header = ReadHeader();
+	EXPECT_EQ(header.height, 1);
+	EXPECT_EQ(header.root_page_id, leaves[0]);
+	EXPECT_EQ(Levels(), (Shape{{{2}}}));
+	EXPECT_EQ(FreePages(), (std::set<page_id_t>{old_root, leaves[1]}));
+	EXPECT_EQ(CollectScan(INT64_MIN, INT64_MAX), WithRids({2}));
+}
+
+// 1 .. 12 ascending at MIN_FANOUT: height 3, every internal node at its floor.
+//
+//     [5 9]
+//     [3] [7] [11]
+//     [1 2] [3 4] [5 6] [7 8] [9 10] [11 12]
+static const Shape kTwelveShape{
+    {{5, 9}}, {{3}, {7}, {11}}, {{1, 2}, {3, 4}, {5, 6}, {7, 8}, {9, 10}, {11, 12}}};
+
+// After 4, 1, 2 are deleted from kTwelveShape: leaf [2] merges with [3], which empties internal
+// [3] down to one child; its right sibling [7] is at the floor too, so the two internal nodes
+// merge and 5 comes DOWN from the root. Two pages freed, height unchanged.
+static const Shape kAfterCascadeShape{
+    {{9}}, {{5, 7}, {11}}, {{3}, {5, 6}, {7, 8}, {9, 10}, {11, 12}}};
+
+TEST_F(BPlusTreeTest, DeleteCascadesALeafMergeIntoAnInternalMerge) {
+	for (index_key_t k = 1; k <= 12; ++k) ASSERT_NO_FATAL_FAILURE(InsertAll({k}));
+	ASSERT_EQ(Levels(), kTwelveShape);
+	ASSERT_NO_FATAL_FAILURE(DeleteAll({4, 1}));
+	const auto tree_pages = TreePages();
+
+	ASSERT_NO_FATAL_FAILURE(DeleteAll({2}));
+
+	EXPECT_EQ(Levels(), kAfterCascadeShape);
+	EXPECT_EQ(Height(), 3);
+	const auto freed = FreePages();
+	EXPECT_EQ(freed.size(), 2u);
+	for (const page_id_t id : freed) {
+		EXPECT_TRUE(std::ranges::binary_search(tree_pages, id)) << "freed a non-tree page " << id;
+	}
+}
+
+// From kAfterCascadeShape, empty the right subtree's first leaf: the leaf merges, internal [11]
+// drops to one child, and its LEFT sibling [5 7] has a child to spare — a rotation through the
+// root: child [7 8] moves right, the root's 9 comes down, and 7 goes up.
+TEST_F(BPlusTreeTest, DeleteRotatesAnInternalNodeFromTheLeft) {
+	for (index_key_t k = 1; k <= 12; ++k) ASSERT_NO_FATAL_FAILURE(InsertAll({k}));
+	ASSERT_NO_FATAL_FAILURE(DeleteAll({4, 1, 2}));
+	ASSERT_EQ(Levels(), kAfterCascadeShape);
+
+	ASSERT_NO_FATAL_FAILURE(DeleteAll({12, 10, 9}));
+
+	EXPECT_EQ(Levels(), (Shape{{{7}}, {{5}, {9}}, {{3}, {5, 6}, {7, 8}, {11}}}));
+	EXPECT_EQ(CollectScan(INT64_MIN, INT64_MAX), WithRids({3, 5, 6, 7, 8, 11}));
+}
+
+// The mirror: the LEFTMOST internal node underflows and its right sibling has three children.
+// Keys are 10 .. 120 so 66 fits between 65 and 70; inserting 65 and 66 gives internal [70] a
+// third child. The right sibling's first child moves left, the root's 50 comes down in front of
+// it, and the sibling's first separator, 65, goes up.
+TEST_F(BPlusTreeTest, DeleteRotatesAnInternalNodeFromTheRight) {
+	for (index_key_t k = 10; k <= 120; k += 10) ASSERT_NO_FATAL_FAILURE(InsertAll({k}));
+	ASSERT_NO_FATAL_FAILURE(InsertAll({65, 66}));
+	ASSERT_EQ(Levels(),
+	          (Shape{{{50, 90}},
+	                 {{30}, {65, 70}, {110}},
+	                 {{10, 20}, {30, 40}, {50, 60}, {65, 66}, {70, 80}, {90, 100}, {110, 120}}}));
+
+	ASSERT_NO_FATAL_FAILURE(DeleteAll({40, 10, 20}));
+
+	EXPECT_EQ(Levels(), (Shape{{{65, 90}},
+	                           {{50}, {70}, {110}},
+	                           {{30}, {50, 60}, {65, 66}, {70, 80}, {90, 100}, {110, 120}}}));
+}
+
+// A cascade that reaches the root: leaf merge, internal merge, and the root left with one child
+// collapses — height 3 to 2 in a single Delete, three pages freed.
+TEST_F(BPlusTreeTest, DeleteCascadesAllTheWayToARootCollapse) {
+	for (index_key_t k = 1; k <= 12; ++k) ASSERT_NO_FATAL_FAILURE(InsertAll({k}));
+	ASSERT_NO_FATAL_FAILURE(DeleteAll({4, 1, 2, 12, 10, 9, 6}));
+	ASSERT_EQ(Levels(), (Shape{{{7}}, {{5}, {9}}, {{3}, {5}, {7, 8}, {11}}}));
+	const auto before = FreePages();
+	const page_id_t old_root = ReadHeader().root_page_id;
+
+	ASSERT_NO_FATAL_FAILURE(DeleteAll({3}));
+
+	EXPECT_EQ(Height(), 2);
+	EXPECT_EQ(Levels(), (Shape{{{7, 9}}, {{5}, {7, 8}, {11}}}));
+	const auto after = FreePages();
+	EXPECT_TRUE(after.contains(old_root));
+	// FreePages leaves its own probe page behind, hence the + 1.
+	EXPECT_EQ(after.size(), before.size() + 1 + 3);
+}
+
+// Ascending, descending and shuffled deletes of 1 .. 40 each drain the tree to a single EMPTY
+// root leaf, valid after every step (DeleteAll checks), and every page the drain unlinked is on
+// the free list — nothing leaked. The tree still works afterwards, and after a reopen.
+TEST_F(BPlusTreeTest, DeleteInAnyOrderDrainsToAnEmptyRootLeaf) {
+	constexpr index_key_t kN = 40;
+	std::vector<index_key_t> ascending(static_cast<std::size_t>(kN));
+	std::iota(ascending.begin(), ascending.end(), index_key_t{1});
+	const std::vector<index_key_t> descending(ascending.rbegin(), ascending.rend());
+	std::vector<index_key_t> shuffled = ascending;
+	std::shuffle(shuffled.begin(), shuffled.end(), std::mt19937{7});
+
+	struct Case {
+		const char* name;
+		std::vector<index_key_t> keys;
+	};
+	const Case cases[] = {
+	    {"ascending", ascending},
+	    {"descending", descending},
+	    {"shuffled", shuffled},
+	};
+	for (const Case& c : cases) {
+		SCOPED_TRACE(c.name);
+		auto created = BPlusTree::Create(*bpm_, kFanout, kFanout);
+		ASSERT_TRUE(created.has_value()) << created.error().message();
+		tree_ = std::move(created.value());
+
+		ASSERT_NO_FATAL_FAILURE(InsertAll(ShuffledKeys(kN)));
+		ASSERT_GE(Height(), 3);
+		const auto full = TreePages();
+
+		ASSERT_NO_FATAL_FAILURE(DeleteAll(c.keys));
+
+		EXPECT_EQ(Height(), 1);
+		EXPECT_EQ(Levels(), (Shape{{{}}}));
+		EXPECT_EQ(CollectScan(INT64_MIN, INT64_MAX), WithRids({}));
+
+		const auto remaining = TreePages();
+		std::vector<page_id_t> freed;
+		std::ranges::set_difference(full, remaining, std::back_inserter(freed));
+		EXPECT_EQ(freed.size(), full.size() - 2);
+		const auto free = FreePages();
+		for (const page_id_t id : freed) EXPECT_TRUE(free.contains(id)) << "leaked page " << id;
+
+		ASSERT_NO_FATAL_FAILURE(InsertAll({5, 1, 9}));
+		EXPECT_EQ(CollectScan(INT64_MIN, INT64_MAX), WithRids({1, 5, 9}));
+	}
+
+	ASSERT_NO_FATAL_FAILURE(Reopen());
+	EXPECT_TRUE(tree_->CheckInvariants());
+	EXPECT_EQ(CollectScan(INT64_MIN, INT64_MAX), WithRids({1, 5, 9}));
+}
+
+// The Delete that cascades in DeleteCascadesALeafMergeIntoAnInternalMerge needs TWO siblings at
+// height 3. With the pool pinned so that the first, then the second, sibling fetch fails, Delete
+// returns the error and the tree is byte-for-byte unchanged — the leaf entry was not removed
+// before the planning pass finished. With the pool free again, the same Delete goes through.
+TEST_F(BPlusTreeTest, DeleteThatCannotFetchASiblingLeavesTheTreeUntouched) {
+	for (index_key_t k = 1; k <= 12; ++k) ASSERT_NO_FATAL_FAILURE(InsertAll({k}));
+	ASSERT_NO_FATAL_FAILURE(DeleteAll({4, 1}));
+	const auto bytes = TreeBytes();
+	const auto shape = Levels();
+
+	// Delete holds the header and the root-to-leaf path: 1 + height frames. `spare` more are left
+	// free, so sibling fetch number spare + 1 is the one that fails. The pins are fresh pages,
+	// never tree pages, so no fetch waits on this thread.
+	const std::size_t held_by_delete = 1 + Height();
+	for (const std::size_t spare : {std::size_t{0}, std::size_t{1}}) {
+		SCOPED_TRACE(testing::Message() << spare << " spare frames");
+		{
+			std::vector<WritePageGuard> pins;
+			for (std::size_t i = 0; i < kFrames - held_by_delete - spare; ++i) {
+				auto guard = bpm_->NewPage();
+				ASSERT_TRUE(guard.has_value()) << guard.error().message();
+				pins.push_back(std::move(guard.value()));
+			}
+
+			const Status s = tree_->Delete(2);
+			EXPECT_EQ(s.code(), ErrorCode::kBufferPoolFull) << s.message();
+		}
+
+		EXPECT_EQ(TreeBytes(), bytes);
+		EXPECT_EQ(Levels(), shape);
+		EXPECT_TRUE(tree_->CheckInvariants());
+		auto rid = tree_->Get(2);
+		ASSERT_TRUE(rid.has_value()) << rid.error().message();
+		EXPECT_EQ(rid.value(), RidFor(2));
+	}
+
+	ASSERT_NO_FATAL_FAILURE(DeleteAll({2}));
+	EXPECT_EQ(Levels(), kAfterCascadeShape);
+}
+
+// Borrows, merges and a root collapse, then a reopen: the shape, the chain and every key come
+// back from disk.
+TEST_F(BPlusTreeTest, DeletesSurviveAReopen) {
+	for (index_key_t k = 1; k <= 12; ++k) ASSERT_NO_FATAL_FAILURE(InsertAll({k}));
+	ASSERT_NO_FATAL_FAILURE(DeleteAll({4, 1, 2, 12, 10, 9, 6, 3}));
+	const auto shape = Levels();
+	const auto leaves = LeafPages();
+	ASSERT_EQ(Height(), 2);
+
+	ASSERT_NO_FATAL_FAILURE(Reopen());
+
+	EXPECT_TRUE(tree_->CheckInvariants());
+	EXPECT_EQ(Levels(), shape);
+	EXPECT_EQ(LeafPages(), leaves);
+	EXPECT_EQ(CollectScan(INT64_MIN, INT64_MAX), WithRids({5, 7, 8, 11}));
+}
+
+// ---------------------------------------------------------------------------------------------
 // Get
 // ---------------------------------------------------------------------------------------------
 
@@ -1114,11 +1561,12 @@ TEST_F(BPlusTreeTest, NextReportsACorruptLeafAndStaysExhausted) {
 }
 
 // Collect the keys from a scan, let the iterator die, then Insert/Delete each — completes
-// rather than hanging. The documented pattern for "mutate what you scanned".
+// rather than hanging. The documented pattern for "mutate what you scanned", and the shape of an
+// index-driven DELETE.
 //
-// Insert only until Delete is defined. A live iterator holds a read latch on its leaf, and an
-// Insert on this same thread would wait for the write latch on it forever — so the pin check
-// before mutating is what turns that regression into a failure instead of a hang.
+// A live iterator holds a read latch on its leaf, and an Insert or Delete on this same thread
+// would wait for the write latch on it forever — so the pin check before mutating is what turns
+// that regression into a failure instead of a hang.
 TEST_F(BPlusTreeTest, CollectThenMutateDoesNotDeadlock) {
 	ASSERT_NO_FATAL_FAILURE(BuildReferenceTree());
 
@@ -1135,6 +1583,10 @@ TEST_F(BPlusTreeTest, CollectThenMutateDoesNotDeadlock) {
 	std::vector<index_key_t> all = kReferenceKeys;
 	all.insert(all.end(), added.begin(), added.end());
 	EXPECT_EQ(CollectScan(INT64_MIN, INT64_MAX), WithRids(all));
+
+	// Then every key scanned, so leaves borrow and merge while we do.
+	ASSERT_NO_FATAL_FAILURE(DeleteAll(scanned));
+	EXPECT_EQ(CollectScan(INT64_MIN, INT64_MAX), WithRids(added));
 }
 
 }  // namespace kernsql

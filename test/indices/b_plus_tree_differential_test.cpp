@@ -1,4 +1,5 @@
 #include <gtest/gtest.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <cstdint>
@@ -10,8 +11,6 @@
 #include <tuple>
 #include <utility>
 #include <vector>
-
-#include <unistd.h>
 
 #include "buffer/buffer_pool_manager.hpp"
 #include "common/status.hpp"
@@ -36,7 +35,9 @@ namespace kernsql {
  *
  * 5 fanout pairs × 5 seeds. More seeds find more, but every case costs ~10 s under asan/tsan.
  *
- * Insert and point/range reads only. Delete joins the op mix once it exists.
+ * Inserts outnumber deletes, so the tree grows through every height while deletes borrow and merge
+ * all the way up. At the end every remaining key is deleted in random order: the tree must drain
+ * to one empty root leaf, and every page it ever freed must be back on the free list.
  */
 
 // (leaf_max, internal_max), seed.
@@ -46,11 +47,11 @@ class BPlusTreeDifferentialTest : public ::testing::TestWithParam<DifferentialPa
   protected:
 	static constexpr int kOps = 2000;
 
-	// Small enough that roughly a third of the inserts are duplicates by the end, so the
-	// duplicate path runs against every shape the tree passes through.
+	// Small enough that many inserts are duplicates and many deletes hit a present key, so both
+	// the duplicate and the not-found paths run against every shape the tree passes through.
 	static constexpr uint64_t kKeyRange = 2000;
 
-	// Not BPlusTreeTest's 16: at MIN_FANOUT ~1300 keys reach height 8 or more, and Insert peaks
+	// Not BPlusTreeTest's 16: at MIN_FANOUT ~1000 keys reach height 8 or more, and Insert peaks
 	// at 2H + 2 frames.
 	static constexpr std::size_t kFrames = 64;
 
@@ -158,7 +159,7 @@ TEST_P(BPlusTreeDifferentialTest, MatchesAStdMap) {
 		SCOPED_TRACE(testing::Message() << "seed " << std::get<1>(GetParam()) << ", op " << op);
 		const uint64_t roll = rng_() % 100;
 
-		if (roll < 70) {
+		if (roll < 50) {
 			// The RID comes from the op, not the key, so a duplicate that overwrote the stored
 			// RID shows up on the next Get of that key.
 			const index_key_t key = RandomKey();
@@ -172,6 +173,17 @@ TEST_P(BPlusTreeDifferentialTest, MatchesAStdMap) {
 				ASSERT_TRUE(s.ok()) << s.message();
 				oracle_.emplace(key, rid);
 			}
+		} else if (roll < 70) {
+			const index_key_t key = RandomKey();
+			SCOPED_TRACE(testing::Message() << "delete " << key);
+
+			const Status s = tree_->Delete(key);
+			if (oracle_.erase(key) == 1) {
+				ASSERT_TRUE(s.ok()) << s.message();
+			} else {
+				ASSERT_EQ(s.code(), ErrorCode::kNotFound) << s.message();
+			}
+			ASSERT_NO_FATAL_FAILURE(ExpectGetMatches(key));
 		} else if (roll < 90) {
 			const index_key_t key = RandomKey();
 			ASSERT_NO_FATAL_FAILURE(ExpectGetMatches(key));
@@ -200,6 +212,43 @@ TEST_P(BPlusTreeDifferentialTest, MatchesAStdMap) {
 	for (const auto& [key, rid] : oracle_) {
 		ASSERT_NO_FATAL_FAILURE(ExpectGetMatches(key));
 	}
+
+	// Drain: every remaining key, in random order.
+	std::vector<index_key_t> keys;
+	for (const auto& [key, rid] : oracle_) keys.push_back(key);
+	std::ranges::shuffle(keys, rng_);
+	for (std::size_t i = 0; i < keys.size(); ++i) {
+		SCOPED_TRACE(testing::Message() << "drain " << i << ", delete " << keys[i]);
+		const Status s = tree_->Delete(keys[i]);
+		ASSERT_TRUE(s.ok()) << s.message();
+		oracle_.erase(keys[i]);
+		if (i % 10 == 0) {
+			ASSERT_TRUE(tree_->CheckInvariants());
+			ASSERT_NO_FATAL_FAILURE(ExpectGetMatches(keys[i]));
+		}
+	}
+	ASSERT_TRUE(tree_->CheckInvariants());
+	ASSERT_NO_FATAL_FAILURE(ExpectScanMatches(INT64_MIN, INT64_MAX));
+
+	// One empty root leaf, and the file holds nothing else: the two reserved pages, the header,
+	// the root, and the free list. NewPage hands out free pages before it extends the file, so
+	// counting the ids it returns below the end of the file counts the free list.
+	{
+		auto header_guard = bpm_->FetchPageRead(tree_->HeaderPageId());
+		ASSERT_TRUE(header_guard.has_value()) << header_guard.error().message();
+		auto header = ReadIndexHeader(header_guard.value());
+		ASSERT_TRUE(header.has_value()) << header.error().message();
+		ASSERT_EQ(header->height, 1);
+	}
+	const page_id_t end = dm_->PageCount();
+	page_id_t free_pages = 0;
+	for (;;) {
+		auto probe = bpm_->NewPage();
+		ASSERT_TRUE(probe.has_value()) << probe.error().message();
+		if (probe->PageId() >= end) break;
+		++free_pages;
+	}
+	ASSERT_EQ(free_pages, end - 4) << "pages leaked by the drain";
 }
 
 // "leaf3_internal5_seed7", so a failing ctest name says how to replay it. A function rather than
@@ -212,15 +261,14 @@ std::string DifferentialName(const testing::TestParamInfo<DifferentialParam>& in
 
 // 3/5 and 5/3 catch leaf_max_ and internal_max_ swapped somewhere. NODE_CAPACITY only reaches
 // height 2 in 2000 ops, but it is the fanout production uses.
-INSTANTIATE_TEST_SUITE_P(
-    Fanouts, BPlusTreeDifferentialTest,
-    ::testing::Combine(::testing::Values(std::pair<uint16_t, uint16_t>{3, 3},
-                                         std::pair<uint16_t, uint16_t>{4, 4},
-                                         std::pair<uint16_t, uint16_t>{3, 5},
-                                         std::pair<uint16_t, uint16_t>{5, 3},
-                                         std::pair<uint16_t, uint16_t>{NODE_CAPACITY,
-                                                                       NODE_CAPACITY}),
-                       ::testing::Range<uint32_t>(1, 6)),
-    DifferentialName);
+INSTANTIATE_TEST_SUITE_P(Fanouts, BPlusTreeDifferentialTest,
+                         ::testing::Combine(::testing::Values(std::pair<uint16_t, uint16_t>{3, 3},
+                                                              std::pair<uint16_t, uint16_t>{4, 4},
+                                                              std::pair<uint16_t, uint16_t>{3, 5},
+                                                              std::pair<uint16_t, uint16_t>{5, 3},
+                                                              std::pair<uint16_t, uint16_t>{
+                                                                  NODE_CAPACITY, NODE_CAPACITY}),
+                                            ::testing::Range<uint32_t>(1, 6)),
+                         DifferentialName);
 
 }  // namespace kernsql
