@@ -35,7 +35,7 @@ repository.
 | `BufferPoolManager` — sharded page table, frame state machine, RAII page guards | done, tested (incl. concurrency) |
 | `HeapPage` — slotted page, stable RIDs across compaction | done, tested |
 | `TableHeap` — page chain, free-space reuse, concurrent inserts, forward scan | done, tested (incl. concurrency) |
-| Shell — REPL over the buffer pool and table heap, one command per operation | done |
+| Shell — REPL over the catalog (create/insert/get/remove/scan tables) plus raw page inspection | done |
 | B+tree — unique `int64` keys, split, merge/redistribute, range scan | **in design** ([DD-005](design-docs/DD-005-b-plus-tree.md)) |
 | Catalog | planned |
 | Parser, binder, executor | planned |

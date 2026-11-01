@@ -1,6 +1,9 @@
 #include "catalog/table.hpp"
 
+#include <cstddef>
 #include <expected>
+#include <limits>
+#include <map>
 #include <memory>
 #include <string>
 
@@ -24,7 +27,8 @@ Result<std::unique_ptr<Table>> Table::Create(BufferPoolManager& bpm, table_id_t 
 		return std::unexpected(bplus_tree.error());
 	}
 
-	return std::unique_ptr<Table>(new Table(table_id, name, schema, std::move(table_heap.value()),
+	return std::unique_ptr<Table>(new Table(table_id, std::move(name), std::move(schema),
+	                                        std::move(table_heap.value()),
 	                                        std::move(bplus_tree.value())));
 }
 
@@ -38,15 +42,16 @@ Result<std::unique_ptr<Table>> Table::Open(BufferPoolManager& bpm, table_id_t ta
 	auto bplus_tree = BPlusTree::Open(bpm, index_header_page_id);
 	if (!bplus_tree.has_value()) return std::unexpected(bplus_tree.error());
 
-	return std::unique_ptr<Table>(new Table(table_id, name, schema, std::move(table_heap.value()),
+	return std::unique_ptr<Table>(new Table(table_id, std::move(name), std::move(schema),
+	                                        std::move(table_heap.value()),
 	                                        std::move(bplus_tree.value())));
 }
 
 Table::Table(table_id_t table_id, std::string name, Schema schema, std::unique_ptr<TableHeap> heap,
              std::unique_ptr<BPlusTree> index)
     : table_id_(table_id),
-      name_(name),
-      schema_(schema),
+      name_(std::move(name)),
+      schema_(std::move(schema)),
       heap_(std::move(heap)),
       index_(std::move(index)) {}
 
@@ -114,8 +119,102 @@ Result<Row> Table::Get(index_key_t key) {
 		if (bytes.error().code() != ErrorCode::kNotFound) return std::unexpected(bytes.error());
 		return std::unexpected(
 		    Status::Corruption("table " + name_ + ": index maps key " + std::to_string(key) +
-			                   " to (" + std::to_string(rid->page_id) + ", " +
-			                   std::to_string(rid->slot) + "), which holds no row"));
+		                       " to (" + std::to_string(rid->page_id) + ", " +
+		                       std::to_string(rid->slot) + "), which holds no row"));
 	}
 	return schema_.Decode(bytes.value());
+}
+
+TableIterator Table::Scan() {
+	return heap_->Scan();
+}
+
+Result<IndexIterator> Table::ScanIndex(index_key_t lo, index_key_t hi) {
+	return index_->Scan(lo, hi);
+}
+
+Result<Row> Table::RowAt(RID rid) {
+	auto bytes = heap_->Get(rid);
+	if (!bytes.has_value()) return std::unexpected(bytes.error());
+	return schema_.Decode(bytes.value());
+}
+
+bool Table::CheckConsistency() {
+	std::map<index_key_t, RID> heap_rows;
+	{
+		TableIterator it = heap_->Scan();
+		while (true) {
+			auto more = it.Next();
+			if (!more.has_value()) {
+				LOG_DEBUG("table %s: heap scan failed", name_.c_str());
+				return false;
+			}
+			if (!more.value()) break;
+
+			const RID rid = it.Rid();
+			auto row = schema_.Decode(it.Tuple());
+			if (!row.has_value()) {
+				LOG_DEBUG("table %s: row (%d, %u) does not decode", name_.c_str(), rid.page_id,
+				          static_cast<unsigned>(rid.slot));
+				return false;
+			}
+			const index_key_t key = schema_.KeyOf(row.value());
+			if (!heap_rows.emplace(key, rid).second) {
+				LOG_DEBUG("table %s: key %lld appears twice in the heap", name_.c_str(),
+				          static_cast<long long>(key));
+				return false;
+			}
+		}
+	}
+
+	size_t index_entries = 0;
+	{
+		auto it = index_->Scan(std::numeric_limits<index_key_t>::min(),
+		                       std::numeric_limits<index_key_t>::max());
+		if (!it.has_value()) {
+			LOG_DEBUG("table %s: index scan failed to start", name_.c_str());
+			return false;
+		}
+		while (true) {
+			auto more = it->Next();
+			if (!more.has_value()) {
+				LOG_DEBUG("table %s: index scan failed", name_.c_str());
+				return false;
+			}
+			if (!more.value()) break;
+
+			++index_entries;
+			auto found = heap_rows.find(it->Key());
+			if (found == heap_rows.end()) {
+				LOG_DEBUG("table %s: index key %lld has no heap row", name_.c_str(),
+				          static_cast<long long>(it->Key()));
+				return false;
+			}
+			if (found->second != it->Rid()) {
+				LOG_DEBUG("table %s: index maps key %lld to (%d, %u), heap row is at (%d, %u)",
+				          name_.c_str(), static_cast<long long>(it->Key()), it->Rid().page_id,
+				          static_cast<unsigned>(it->Rid().slot), found->second.page_id,
+				          static_cast<unsigned>(found->second.slot));
+				return false;
+			}
+		}
+	}
+
+	if (index_entries != heap_rows.size()) {
+		LOG_DEBUG("table %s: %zu heap rows but %zu index entries", name_.c_str(), heap_rows.size(),
+		          index_entries);
+		return false;
+	}
+
+	return index_->CheckInvariants();
+}
+
+Table::~Table() = default;
+
+page_id_t Table::HeapFirstPageId() const {
+	return heap_->FirstPageId();
+}
+
+page_id_t Table::IndexHeaderPageId() const {
+	return index_->HeaderPageId();
 }

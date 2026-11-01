@@ -77,7 +77,7 @@ Result<Schema> Schema::Create(std::vector<Column> columns, uint16_t primary_key)
 	if (max_row_size > MAX_TUPLE_SIZE) {
 		return std::unexpected(
 		    Status::InvalidArgument("max row size " + std::to_string(max_row_size) +
-			                        " exceeds the limit of " + std::to_string(MAX_TUPLE_SIZE)));
+		                            " exceeds the limit of " + std::to_string(MAX_TUPLE_SIZE)));
 	}
 
 	if (primary_key >= columns.size()) {
@@ -185,7 +185,7 @@ Result<Row> Schema::Decode(std::span<const std::byte> bytes) const {
 		if (length > col.max_length) {
 			return std::unexpected(
 			    Status::Corruption("stored length " + std::to_string(length) + " exceeds VARCHAR(" +
-				                   std::to_string(col.max_length) + ") in " + col.name));
+			                       std::to_string(col.max_length) + ") in " + col.name));
 		}
 		std::string str(length, '\0');
 		if (!read(str.data(), length)) {

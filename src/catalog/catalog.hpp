@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <functional>
 #include <map>
 #include <memory>
@@ -23,6 +24,7 @@ namespace kernsql {
 // Version of the catalog stream below. 0 is "never written": DiskManager creates page 1 with a
 // zeroed body, and that must read as an empty catalog.
 inline constexpr uint32_t CATALOG_FORMAT_VERSION = 1;
+inline constexpr std::size_t CATALOG_HEADER_SIZE = 16;
 
 /*
  * The catalog stream's fixed header (DD-006, "Catalog storage"), at the start of page 1's body.
@@ -44,8 +46,17 @@ struct CatalogHeader {
 	uint32_t stream_length{0};
 	uint32_t table_count{0};
 	uint32_t next_table_id{0};
+
+	static CatalogHeader ReadFrom(std::span<const std::byte, CATALOG_HEADER_SIZE> bytes) {
+		CatalogHeader ch;
+		std::memcpy(&ch, bytes.data(), sizeof(CatalogHeader));
+		return ch;
+	}
+
+	void WriteTo(std::span<std::byte, CATALOG_HEADER_SIZE> bytes) const {
+		std::memcpy(bytes.data(), this, sizeof(CatalogHeader));
+	}
 };
-inline constexpr std::size_t CATALOG_HEADER_SIZE = 16;
 static_assert(sizeof(CatalogHeader) == CATALOG_HEADER_SIZE);
 
 /*
