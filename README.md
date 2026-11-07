@@ -35,14 +35,14 @@ repository.
 | `BufferPoolManager` — sharded page table, frame state machine, RAII page guards | done, tested (incl. concurrency) |
 | `HeapPage` — slotted page, stable RIDs across compaction | done, tested |
 | `TableHeap` — page chain, free-space reuse, concurrent inserts, forward scan | done, tested (incl. concurrency) |
-| Shell — REPL over the buffer pool and table heap, one command per operation | done |
-| B+tree — unique `int64` keys, split, merge/redistribute, range scan | **in design** ([DD-005](design-docs/DD-005-b-plus-tree.md)) |
-| Catalog | planned |
+| Shell — REPL over the catalog (create/insert/get/remove/scan tables) plus raw page inspection | done |
+| B+tree — unique `int64` keys, split, merge/redistribute, range scan | done, tested (incl. differential vs `std::map`) |
+| Catalog — `INT64`/`VARCHAR(n)` row format, persisted catalog on page 1, tables as heap + primary-key index kept in sync | done, tested |
 | Parser, binder, executor | planned |
 | Join algorithms — nested-loop, index nested-loop, hash, sort-merge | planned |
 | Table-level reader-writer locking | planned |
 
-144 tests, green under ASan and TSan. The concurrency suites have caught real bugs — a stale
+417 tests, green under ASan and TSan. The concurrency suites have caught real bugs — a stale
 page-table mapping after delete and a lost `SetEvictable` in the buffer pool — both written up
 in [DD-002](design-docs/DD-002-buffer-pool-manager.md).
 
@@ -150,7 +150,8 @@ The reasoning behind each component, including rejected alternatives:
 - [DD-002 — Buffer pool: concurrency and latching](design-docs/DD-002-buffer-pool-manager.md)
 - [DD-003 — Threading and execution model](design-docs/DD-003-threading-model.md)
 - [DD-004 — Heap pages and table heap](design-docs/DD-004-heap-pages-and-table-heap.md)
-- [DD-005 — B+tree index](design-docs/DD-005-b-plus-tree.md) *(draft)*
+- [DD-005 — B+tree index](design-docs/DD-005-b-plus-tree.md)
+- [DD-006 — Catalog and tables](design-docs/DD-006-catalog-and-tables.md)
 
 ## Project layout
 

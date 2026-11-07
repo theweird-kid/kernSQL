@@ -344,6 +344,36 @@ TEST_F(TableHeapTest, RowsSurviveAReopen) {
 	ExpectNoStrandedPins();
 }
 
+TEST_F(TableHeapTest, AppendWalkFromAStaleLastPagePublishesTheRealEnd) {
+	// The catalog persists only the FIRST page and Open passes it as the last too, so after a
+	// reopen LastPageId() can trail the real end of the chain. The append path walks forward to
+	// the real end; it must also store what it found, or every later insert repeats the walk
+	// until an extension happens to store one.
+	//
+	// Five full pages and a sixth with room: the first insert after the reopen probes pages 1-4
+	// (INSERT_PROBE_LIMIT), finds them full, and falls through to the append walk, which follows
+	// next_page_id from page 1 to page 6 and inserts there without extending.
+	constexpr std::size_t kFullPages = 5;
+	int i = 0;
+	while (ChainPages().size() <= kFullPages) MustInsert(Row(i++));
+	const std::vector<page_id_t> chain = ChainPages();
+	ASSERT_EQ(chain.size(), kFullPages + 1);
+	const page_id_t first = chain.front();
+	const page_id_t last = chain.back();
+	ASSERT_EQ(heap_->LastPageId(), last);
+
+	ASSERT_NO_FATAL_FAILURE(Reopen(first, first));
+	ASSERT_EQ(heap_->LastPageId(), first) << "precondition: the reopen starts from a stale end";
+
+	const RID rid = MustInsert(Row(i));
+	EXPECT_EQ(rid.page_id, last) << "the row belongs on the only page with room";
+	EXPECT_EQ(ChainPages(), chain) << "the walk must not have extended the chain";
+	EXPECT_EQ(heap_->LastPageId(), last) << "the walk found the real end but did not publish it";
+
+	ExpectAllInvariants();
+	ExpectNoStrandedPins();
+}
+
 TEST_F(TableHeapTest, OpenValidatesNothingUntilTheFirstFetch) {
 	// Open() with ids that are not heap pages must SUCCEED, and the first Get/Scan must then fail
 	// with kCorruption from AsHeapPage. Documents the deliberate choice not to read a page in the

@@ -173,6 +173,14 @@ Result<RID> TableHeap::Insert(std::span<const std::byte> tuple) {
 			continue;
 		}
 
+		// Publish what the walk found. last_page_id_ is only a starting point, and after a
+		// reopen from a stale catalog value it can trail the real end by many pages; without
+		// this every insert repeats the whole walk until the next extension finally stores one.
+		// Safe under this latch: moving the end past last_id means extending from last_id, which
+		// needs this same latch, so the value stored here can never be older than one already
+		// published.
+		last_page_id_.store(last_id);
+
 		auto last_heap = AsHeapPage(last_guard.value());
 		if (!last_heap.has_value()) return std::unexpected(last_heap.error());
 

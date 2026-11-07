@@ -13,12 +13,12 @@
             "state": {
               "type": "markdown",
               "state": {
-                "file": "file:/home/gaurav29/c/programming/go/blobstore/PROJECT.md",
+                "file": "design-docs/DD-006-catalog-and-tables.md",
                 "mode": "preview",
                 "source": false
               },
               "icon": "lucide-file",
-              "title": "PROJECT"
+              "title": "DD-006-catalog-and-tables"
             }
           }
         ]
@@ -188,17 +188,18 @@
   },
   "active": "213624f19b44c94b",
   "lastOpenFiles": [
-    "__cmake_systeminformation/AllMacros.txt",
-    "__cmake_systeminformation/results.txt",
-    "__cmake_systeminformation/CMakeFiles/4.3.0/CMakeCXXCompiler.cmake.tmp",
-    "__cmake_systeminformation/CMakeFiles/4.3.0/CMakeDetermineCompilerABI_CXX.bin",
-    "__cmake_systeminformation/CMakeFiles/CMakeScratch/TryCompile-S2shRO/cmTC_64442",
-    "__cmake_systeminformation/CMakeFiles/CMakeScratch/TryCompile-S2shRO/CMakeFiles/cmTC_64442.dir/CMakeCXXCompilerABI.cpp.o",
-    "__cmake_systeminformation/CMakeFiles/CMakeScratch/TryCompile-S2shRO/CMakeFiles/InstallScripts.json",
-    "__cmake_systeminformation/CMakeFiles/CMakeScratch/TryCompile-S2shRO/CMakeFiles/Makefile2",
-    "__cmake_systeminformation/CMakeFiles/CMakeScratch/TryCompile-S2shRO/CMakeFiles/progress.marks",
-    "__cmake_systeminformation/CMakeFiles/CMakeScratch/TryCompile-S2shRO/CMakeFiles/TargetDirectories.txt",
-    "__cmake_systeminformation/CMakeFiles/CMakeScratch/TryCompile-S2shRO/cmake_install.cmake",
+    "build/debug/CMakeFiles/b_plus_tree_test.dir/link.d",
+    "build/debug/CMakeFiles/b_plus_tree_test.dir/test/indices/b_plus_tree_test.cpp.o.d",
+    "build/debug/catalog_test[1]_tests.cmake",
+    "build/debug/cmake_test_discovery_e478073ebd.json",
+    "build/debug/table_test[1]_tests.cmake",
+    "build/debug/cmake_test_discovery_fded9acd7f.json",
+    "build/debug/lib/stadWmIJ",
+    "build/debug/catalog_test",
+    "build/debug/table_test",
+    "build/debug/lib/styf4Xtj",
+    "build/debug/lib/stLKxy1j",
+    "file:/home/gaurav29/c/programming/go/blobstore/PROJECT.md",
     "design-docs/DD-004-heap-pages-and-table-heap.md",
     "design-docs/DD-005-b-plus-tree.md",
     "design-docs/DD-002-buffer-pool-manager.md",

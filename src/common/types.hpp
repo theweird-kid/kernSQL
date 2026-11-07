@@ -10,6 +10,8 @@ using page_id_t = int32_t;
 using slot_id_t = uint16_t;
 using frame_id_t = int32_t;
 using lsn_t = uint64_t;
+// A table's catalog id (DD-006): assigned once, never reused, the order multi-table locks take.
+using table_id_t = uint32_t;
 
 inline constexpr page_id_t INVALID_PAGE = -1;
 inline constexpr page_id_t META_PAGE_ID = 0;          // reserved superblock page; never allocatable
