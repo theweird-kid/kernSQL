@@ -520,8 +520,8 @@ TEST_F(CatalogTest, FormatIsPinned) {
 
 	std::vector<std::byte> expected;
 	auto put = [&](auto value) {
-		const auto* p = reinterpret_cast<const std::byte*>(&value);
-		expected.insert(expected.end(), p, p + sizeof(value));
+		const auto bytes = std::as_bytes(std::span{&value, 1});
+		expected.insert(expected.end(), bytes.begin(), bytes.end());
 	};
 	auto put_name = [&](std::string_view s) {
 		put(static_cast<uint8_t>(s.size()));

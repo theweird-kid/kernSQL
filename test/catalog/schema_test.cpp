@@ -4,9 +4,9 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <cstring>
 #include <limits>
 #include <random>
+#include <span>
 #include <string>
 #include <utility>
 #include <vector>
@@ -22,9 +22,9 @@ namespace kernsql {
  * round trip alone passes for ANY self-consistent encoding, including one that is wrong on disk
  * and would silently break every file written before it was fixed.
  *
- * Expected bytes are built with memcpy, not written as literals, because the format is
- * host-endian (the page_header.hpp convention): the test states the format, not this machine's
- * byte order.
+ * Expected bytes are built from the values' object bytes, not written as literals, because the
+ * format is host-endian (the page_header.hpp convention): the test states the format, not this
+ * machine's byte order.
  */
 
 namespace {
@@ -52,17 +52,19 @@ void ExpectRejected(std::vector<Column> columns, uint16_t primary_key, const cha
 	EXPECT_EQ(schema.error().code(), ErrorCode::kInvalidArgument) << why;
 }
 
+// Append the object representation of `value` — host-endian, exactly what memcpy would copy.
+template <typename T>
+void AppendRaw(std::vector<std::byte>& out, const T& value) {
+	const auto bytes = std::as_bytes(std::span{&value, 1});
+	out.insert(out.end(), bytes.begin(), bytes.end());
+}
 void AppendInt(std::vector<std::byte>& out, int64_t v) {
-	const std::size_t at = out.size();
-	out.resize(at + sizeof v);
-	std::memcpy(out.data() + at, &v, sizeof v);
+	AppendRaw(out, v);
 }
 void AppendVarchar(std::vector<std::byte>& out, std::string_view s) {
-	const auto length = static_cast<uint16_t>(s.size());
-	const std::size_t at = out.size();
-	out.resize(at + sizeof length + s.size());
-	std::memcpy(out.data() + at, &length, sizeof length);
-	std::memcpy(out.data() + at + sizeof length, s.data(), s.size());
+	AppendRaw(out, static_cast<uint16_t>(s.size()));
+	const auto bytes = std::as_bytes(std::span{s});
+	out.insert(out.end(), bytes.begin(), bytes.end());
 }
 
 // The schema most tests share: key not in position 0, so nothing passes by assuming it is.
@@ -347,10 +349,8 @@ TEST(SchemaDecodeTest, AMaximalLengthPrefixDoesNotReadPastTheBytes) {
 	const Schema s = MustCreate({Int("id"), Varchar("v", 1990)});
 	std::vector<std::byte> bytes;
 	AppendInt(bytes, 1);
-	const uint16_t length = 1990;  // legal for the column, but only 3 bytes follow
-	const std::size_t at = bytes.size();
-	bytes.resize(at + sizeof length + 3);
-	std::memcpy(bytes.data() + at, &length, sizeof length);
+	AppendRaw(bytes, uint16_t{1990});  // a length legal for the column, but only 3 bytes follow
+	bytes.resize(bytes.size() + 3);
 
 	auto row = s.Decode(bytes);
 	ASSERT_FALSE(row.has_value());

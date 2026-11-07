@@ -44,20 +44,22 @@ class StreamWriter {
 
 	template <typename T>
 	void Put(T value) {
-		const auto* p = reinterpret_cast<const std::byte*>(&value);
-		out_.insert(out_.end(), p, p + sizeof(T));
+		Append(std::as_bytes(std::span{&value, 1}));
 	}
 
 	// Callers have already checked the length against MAX_NAME_LENGTH, which fits a u8.
 	void PutName(std::string_view name) {
 		Put(static_cast<uint8_t>(name.size()));
-		const auto* p = reinterpret_cast<const std::byte*>(name.data());
-		out_.insert(out_.end(), p, p + name.size());
+		Append(std::as_bytes(std::span{name}));
 	}
 
 	std::vector<std::byte> Take() { return std::move(out_); }
 
   private:
+	void Append(std::span<const std::byte> bytes) {
+		out_.insert(out_.end(), bytes.begin(), bytes.end());
+	}
+
 	std::vector<std::byte> out_;
 };
 
