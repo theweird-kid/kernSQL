@@ -98,6 +98,14 @@ Status Table::Delete(index_key_t key) {
 	Status st = heap_->Delete(rid.value());
 	if (st.ok()) return st;
 
+	// The index named a slot that holds no row: the two sides had already drifted before this
+	// call, which is corruption — the code Get reports for the same state — not a missing key.
+	if (st.code() == ErrorCode::kNotFound) {
+		st = Status::Corruption("table " + name_ + ": index maps key " + std::to_string(key) +
+		                        " to (" + std::to_string(rid->page_id) + ", " +
+		                        std::to_string(rid->slot) + "), which holds no row");
+	}
+
 	// Needs frames index_->Delete just released, so while the pool has a single user only an I/O
 	// error gets here. Put the index entry back so the row stays whole; if that fails too, the
 	// heap holds a row the index doesn't know — the same no-WAL limitation as in Insert.

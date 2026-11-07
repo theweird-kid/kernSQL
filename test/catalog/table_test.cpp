@@ -642,8 +642,10 @@ TEST_F(TableTest, DeleteWhoseHeapStepFailsPutsTheIndexEntryBack) {
 		ASSERT_TRUE(heap->Delete(rid).ok());
 	}
 
+	// Corruption, as Get reports for the same state — not the heap's kNotFound, which would read
+	// as "no such key" to a caller.
 	const Status s = table_->Delete(4);
-	EXPECT_FALSE(s.ok());
+	EXPECT_EQ(s.code(), ErrorCode::kCorruption) << s.message();
 
 	// The index entry is back, with the same RID.
 	EXPECT_EQ(RidOf(4), rid);

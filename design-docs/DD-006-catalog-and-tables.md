@@ -1,6 +1,7 @@
 # Catalog & Tables
 
-**Status:** Draft — decisions 1–3 agreed 2026-10-31; awaiting review of the whole.
+**Status:** Accepted 2026-11-07 — decisions 1–3 agreed 2026-10-31; implemented on
+`feature/catalog`, with the choices made during implementation folded in below.
 **Component:** `src/catalog` (`Schema`, `Value`, `Row` in `schema.hpp`; `Table` in `table.hpp`;
 `Catalog` in `catalog.hpp`; `Database` in `database.hpp`; `table_id_t` in `common/types.hpp`)
 
@@ -149,9 +150,31 @@ again by `CREATE TABLE`. Opening every index reads one header page per table —
 scale.
 
 Nothing on disk is trusted. Any of these is **`kCorruption`**: an unknown `format_version` or
-column type; `stream_length` longer than the chain; a primary-key column out of range or not
-`INT64`; a reserved page id (0 or 1) as a heap or index page; an empty, over-long or duplicate
-name. The same stance as `BPlusTree::Open` rejecting an out-of-range fanout.
+column type; `stream_length` shorter than the header or longer than the chain; a primary-key
+column out of range or not `INT64`; a reserved page id (0 or 1) as a heap or index page; an
+empty, over-long or duplicate name; a duplicate `table_id`, or one not below `next_table_id`;
+bytes left over after the last entry. The same stance as `BPlusTree::Open` rejecting an
+out-of-range fanout.
+
+`Open` walks the **whole** `CATALOG` chain before parsing, not just the `stream_length` bytes it
+needs: `CREATE TABLE` must know every page already linked, or it would allocate a page the chain
+already has. The walk is checked too — a page seen twice (a cycle), a link to a reserved page,
+or a page in the chain not typed `CATALOG` is `kCorruption`. So is a never-written header
+(`format_version` 0) on a page 1 that links onward: an empty catalog has no reason to own a
+second page.
+
+Every entry is parsed and validated **before any table is opened**, so a corrupt entry late in
+the stream never leaves earlier tables half-opened.
+
+### Small choices
+
+- **Entries are serialized in name order** (the in-memory map's order), not creation order. The
+  order carries no meaning, `Open` builds a map anyway, and it makes the stream a pure function
+  of the catalog's contents.
+- **`next_table_id` starts at 0** and is spent only when `CREATE TABLE` succeeds; a failed one
+  leaves the counter where it was. Ids stay dense in the common case, and still never reused.
+- **`Database::Open` shuts the pool down** if `Catalog::Open` fails, so a corrupt file returns
+  its error instead of taking the pool destructor's caller-bug path.
 
 ## Keeping the heap and the index in sync
 
@@ -187,7 +210,10 @@ same kind as DD-005's partially-applied multi-row `DELETE`.
 1. `tree.Get(key)` → `RID`; absent → `kNotFound`.
 2. `tree.Delete(key)`. On failure **nothing has changed** — return the error.
 3. `heap.Delete(rid)`. One frame, and `tree.Delete` just released up to 2H, so again only I/O
-   can fail it; if it does, undo with `tree.Insert(key, rid)`, best effort.
+   can fail it; if it does, undo with `tree.Insert(key, rid)`, best effort. A heap `kNotFound`
+   here means the index named a slot that holds no row — the same drift `Get` reports — so it is
+   returned as **`kCorruption`**, never as a missing key; the undo still runs, leaving the table
+   exactly as drifted as before the call.
 
 Heap first would be the wrong way round: a failed tree step would leave an index entry pointing
 at a deleted row, and every later insert of that key would be refused as a duplicate of a row
@@ -296,12 +322,16 @@ per-table statement lock, exactly as `BPlusTree` does.
 - **The catalog stores a heap's first page only, not its last.** DD-004 says "the catalog holds
   each table's `first_page_id` and `last_page_id`", but the last page moves every time the chain
   grows — far too often to rewrite the catalog for. `Table::Open` passes the first page as both.
-  That is safe as it stands: `TableHeap::Insert` already treats the last page as a hint and
-  follows `next_page_id` forward from it under the extension latch, so the first append after an
-  open walks the chain once and caches the real end. DD-004's own rule — anything that spans pages
-  is a hint, never a truth — applied to one more field.
+  That is safe: `TableHeap::Insert` already treats the last page as a hint and follows
+  `next_page_id` forward from it under the extension latch. DD-004's own rule — anything that
+  spans pages is a hint, never a truth — applied to one more field.
+- **The walk publishes what it finds.** As first implemented, that walk never stored the end it
+  reached — only an extension did — so after a reopen every append-path insert repeated the full
+  walk until the chain next grew. Fixed 2026-11-07: the walk stores `last_page_id_` once it holds
+  the latch on the real last page. Storing under that latch cannot move the value backwards,
+  because extending past that page needs the same latch.
 
-## Open questions
+## Resolved questions
 
-- **Default `pool_frames` for `Database::Open`.** Tests pass their own; the shell needs a
-  default. Proposed, and in `database.hpp` as `DEFAULT_POOL_FRAMES`: 256 frames (1 MiB).
+- **Default `pool_frames` for `Database::Open`:** 256 frames (1 MiB), `DEFAULT_POOL_FRAMES` in
+  `database.hpp`. Tests pass their own; the shell uses the default.
