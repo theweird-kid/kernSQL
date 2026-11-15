@@ -51,6 +51,16 @@ class Database {
 	// file. Idempotent, as the pool's is.
 	[[nodiscard]] Status Shutdown();
 
+	/*
+	 * Make everything written so far durable WITHOUT shutting down: flush every dirty page, then
+	 * fsync. The shell calls it after each statement that changes data, so a result printed on
+	 * screen is a result on disk — a later crash or `kill -9` cannot take it back.
+	 *
+	 * Unlike Shutdown it does not require quiescence and the pool stays usable. Not atomic: with
+	 * no WAL (DD-006), a crash DURING the flush can leave some pages new and some old.
+	 */
+	[[nodiscard]] Status Checkpoint();
+
 	[[nodiscard]] Catalog& GetCatalog() { return *catalog_; }
 
 	// For tests that pin frames or read pool stats. Nothing on a production path needs it.
