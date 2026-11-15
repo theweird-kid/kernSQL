@@ -236,10 +236,6 @@ TEST_F(ExecutorTest, BinderErrors) {
 	ExpectError("SELECT * FROM people WHERE name = age", ErrorCode::kInvalidArgument,
 	            "type mismatch");
 	ExpectError("SELECT * FROM people WHERE 1 = 'a'", ErrorCode::kInvalidArgument, "type mismatch");
-	ExpectError("SELECT * FROM people JOIN people ON id = id", ErrorCode::kInvalidArgument,
-	            "JOIN is not supported yet");
-	ExpectError("SELECT * FROM people ORDER BY id", ErrorCode::kInvalidArgument,
-	            "ORDER BY is not supported yet");
 	// Parser errors come through unchanged.
 	ExpectError("SELECT * FORM people", ErrorCode::kInvalidArgument, "expected FROM");
 	EXPECT_TRUE(Consistent("people"));

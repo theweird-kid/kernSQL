@@ -1,6 +1,9 @@
 #include "sql/executor/operators.hpp"
 
+#include <algorithm>
 #include <cassert>
+#include <compare>
+#include <cstddef>
 #include <expected>
 #include <format>
 #include <limits>
@@ -138,14 +141,108 @@ std::string Projection::Describe() const {
 	return out;
 }
 
+// ---- Sort ----
+
+Result<bool> Sort::Next(Row& row) {
+	if (!sorted_) {
+		Row input;
+		while (true) {
+			Result<bool> more = child_->Next(input);
+			if (!more.has_value()) return std::unexpected(std::move(more.error()));
+			if (!*more) break;
+			rows_.push_back(input);
+		}
+		std::ranges::stable_sort(rows_, [this](const Row& a, const Row& b) {
+			for (const BoundSortKey& key : keys_) {
+				const std::strong_ordering order = a[key.column] <=> b[key.column];
+				if (order != 0) {
+					return key.descending ? order > 0 : order < 0;
+				}
+			}
+			return false;  // equal on every key: keep the child's order (stable)
+		});
+		sorted_ = true;
+	}
+	if (next_ == rows_.size()) {
+		return false;
+	}
+	row = std::move(rows_[next_++]);
+	return true;
+}
+
+// ---- Joins ----
+
+Result<bool> JoinBase::Next(Row& row) {
+	if (!built_) {
+		std::vector<Row> right_rows;
+		Row input;
+		while (true) {
+			Result<bool> more = right_->Next(input);
+			if (!more.has_value()) return std::unexpected(std::move(more.error()));
+			if (!*more) break;
+			right_rows.push_back(input);
+		}
+		Build(std::move(right_rows));
+		built_ = true;
+	}
+
+	// Emit the current left row's remaining matches; when they run out, pull the next left row.
+	while (next_ == matches_.size()) {
+		Result<bool> more = left_->Next(left_row_);
+		if (!more.has_value() || !*more) {
+			return more;
+		}
+		matches_.clear();
+		next_ = 0;
+		Matches(left_row_[left_column_], matches_);
+	}
+	const Row& right_row = *matches_[next_++];
+	row = left_row_;
+	row.insert(row.end(), right_row.begin(), right_row.end());
+	return true;
+}
+
+void NestedLoopJoin::Matches(const Value& key, std::vector<const Row*>& out) const {
+	for (const Row& right_row : rows_) {
+		if (right_row[right_column_] == key) {
+			out.push_back(&right_row);
+		}
+	}
+}
+
+void HashJoin::Build(std::vector<Row> right_rows) {
+	rows_ = std::move(right_rows);
+	table_.reserve(rows_.size());
+	for (const Row& right_row : rows_) {
+		table_.emplace(right_row[right_column_], &right_row);
+	}
+}
+
+void HashJoin::Matches(const Value& key, std::vector<const Row*>& out) const {
+	const auto [begin, end] = table_.equal_range(key);
+	for (auto it = begin; it != end; ++it) {
+		out.push_back(it->second);
+	}
+	// equal_range has no defined order; restore the right side's scan order, so a hash join and
+	// a nested-loop join over the same input emit identical sequences, not just identical sets.
+	std::ranges::sort(out);
+}
+
 // ---- EXPLAIN ----
+
+namespace {
+
+void Explain(const Operator& op, std::size_t depth, std::vector<std::string>& lines) {
+	lines.push_back(std::string(2 * depth, ' ') + op.Describe());
+	for (const Operator* child : op.Children()) {
+		Explain(*child, depth + 1, lines);
+	}
+}
+
+}  // namespace
 
 std::vector<std::string> kernsql::ExplainLines(const Operator& root) {
 	std::vector<std::string> lines;
-	std::size_t depth = 0;
-	for (const Operator* op = &root; op != nullptr; op = op->Child()) {
-		lines.push_back(std::string(2 * depth, ' ') + op->Describe());
-		++depth;
-	}
+	Explain(root, 0, lines);
 	return lines;
 }

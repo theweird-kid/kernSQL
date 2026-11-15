@@ -1,6 +1,7 @@
 #include "sql/executor/planner.hpp"
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <optional>
@@ -10,6 +11,7 @@
 #include <vector>
 
 #include "indices/b_plus_tree_page.hpp"
+#include "sql/parser/ast.hpp"
 
 using namespace kernsql;
 
@@ -131,14 +133,92 @@ std::unique_ptr<Operator> kernsql::PlanScan(Table& table, std::vector<BoundCompa
 	return plan;
 }
 
-std::unique_ptr<Operator> kernsql::PlanSelect(const BoundSelect& select) {
-	std::unique_ptr<Operator> plan = PlanScan(*select.table, select.where);
+namespace {
+
+// Which tables a WHERE term names, given that positions below `left_width` are the left table's.
+struct Sides {
+	bool left{false};
+	bool right{false};
+};
+
+Sides SidesOf(const BoundComparison& term, std::size_t left_width) {
+	Sides sides;
+	for (const BoundOperand* operand : {&term.lhs, &term.rhs}) {
+		if (const auto* column = std::get_if<BoundColumn>(operand)) {
+			(column->index < left_width ? sides.left : sides.right) = true;
+		}
+	}
+	return sides;
+}
+
+// A right-only term, renumbered from the combined row into the right table's own row.
+BoundComparison ShiftToRight(BoundComparison term, std::size_t left_width) {
+	for (BoundOperand* operand : {&term.lhs, &term.rhs}) {
+		if (auto* column = std::get_if<BoundColumn>(operand)) {
+			column->index = static_cast<uint16_t>(column->index - left_width);
+		}
+	}
+	return term;
+}
+
+std::unique_ptr<Operator> PlanJoin(const BoundSelect& select, JoinAlgorithm algorithm) {
+	const BoundJoin& join = *select.join;
+	const std::size_t left_width = select.table->GetSchema().ColumnCount();
+
+	std::vector<BoundComparison> left_terms;
+	std::vector<BoundComparison> right_terms;
+	std::vector<BoundComparison> residual;
+	for (const BoundComparison& term : select.where) {
+		const Sides sides = SidesOf(term, left_width);
+		if (sides.left && !sides.right) {
+			left_terms.push_back(term);
+		} else if (sides.right && !sides.left) {
+			right_terms.push_back(ShiftToRight(term, left_width));
+		} else {
+			residual.push_back(term);  // both tables, or a constant like `1 = 1`
+		}
+	}
+
+	std::unique_ptr<Operator> left = PlanScan(*select.table, std::move(left_terms));
+	std::unique_ptr<Operator> right = PlanScan(*join.table, std::move(right_terms));
+	std::string on = ToSql(join.source);
+	std::unique_ptr<Operator> plan;
+	if (algorithm == JoinAlgorithm::kHash) {
+		plan = std::make_unique<HashJoin>(std::move(left), std::move(right), join.left_column,
+		                                  join.right_column, std::move(on));
+	} else {
+		plan = std::make_unique<NestedLoopJoin>(std::move(left), std::move(right), join.left_column,
+		                                        join.right_column, std::move(on));
+	}
+	if (!residual.empty()) {
+		plan = std::make_unique<Filter>(std::move(plan), std::move(residual));
+	}
+	return plan;
+}
+
+}  // namespace
+
+std::unique_ptr<Operator> kernsql::PlanSelect(const BoundSelect& select, JoinAlgorithm algorithm) {
+	std::unique_ptr<Operator> plan = select.join.has_value()
+	                                     ? PlanJoin(select, algorithm)
+	                                     : PlanScan(*select.table, select.where);
+
+	if (!select.order_by.empty()) {
+		std::string description;
+		for (const BoundSortKey& key : select.order_by) {
+			if (!description.empty()) description += ", ";
+			description += select.column_names[key.column];
+			if (key.descending) description += " DESC";
+		}
+		plan = std::make_unique<Sort>(std::move(plan), select.order_by, std::move(description));
+	}
+
 	if (select.projection.empty()) {
-		return plan;  // SELECT *: the scan's rows are already in schema order
+		return plan;  // SELECT *: the rows are already the combined row, in order
 	}
 	std::vector<std::string> names;
 	for (uint16_t column : select.projection) {
-		names.push_back(select.table->GetSchema().Columns()[column].name);
+		names.push_back(select.column_names[column]);
 	}
 	return std::make_unique<Projection>(std::move(plan), select.projection, std::move(names));
 }

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <variant>
 #include <vector>
@@ -26,11 +27,19 @@ namespace kernsql {
  *
  * Errors, all before anything is touched:
  *   kNotFound         a table or column that does not exist
- *   kInvalidArgument  everything else — a type mismatch, JOIN / ORDER BY (until the joins stage),
- *                     a qualified name whose table is not the FROM table, an INSERT row that fails
- *                     Schema::Validate, an invalid CREATE TABLE schema
+ *   kInvalidArgument  everything else — a type mismatch, a column name found in both joined
+ *                     tables without a qualifier, a qualified name whose table is not in FROM, a
+ *                     JOIN of a table with itself or whose ON is not `a.x = b.y`, an INSERT row
+ *                     that fails Schema::Validate, an invalid CREATE TABLE schema
  *   kDuplicateKey     CREATE TABLE of an existing name, or an INSERT whose key is already present
  *                     or appears twice in its own VALUES list
+ */
+
+/*
+ * THE ROW A SELECT WORKS ON. Without a JOIN it is the FROM table's row. With one it is the FROM
+ * table's columns followed by the JOIN table's — what a join emits — and every column position in
+ * a BoundSelect (projection, WHERE, ORDER BY) counts into that combined row. So `people JOIN pets`
+ * with 3 and 2 columns has positions 0..2 for people and 3..4 for pets.
  */
 
 // One side of a bound comparison: a column of the row, by position, or a literal.
@@ -59,11 +68,30 @@ struct BoundInsert {
 	std::vector<Row> rows;  // every row has passed Schema::Validate; keys are distinct and new
 };
 
+// JOIN table ON left = right, with each side's column counted in ITS OWN table's row.
+struct BoundJoin {
+	Table* table{nullptr};  // the JOIN (right) table
+	uint16_t left_column{0};
+	uint16_t right_column{0};
+	Comparison source{};  // the ON as written, for EXPLAIN
+};
+
+struct BoundSortKey {
+	uint16_t column{0};  // in the combined row
+	bool descending{false};
+};
+
 struct BoundSelect {
-	Table* table{nullptr};
-	// Positions to output, in order. EMPTY MEANS EVERY COLUMN, in schema order (SELECT *).
+	Table* table{nullptr};  // the FROM (left) table
+	std::optional<BoundJoin> join{};
+
+	// One name per column of the combined row (above). For result headers and EXPLAIN.
+	std::vector<std::string> column_names{};
+
+	// Positions to output, in order. EMPTY MEANS EVERY COLUMN of the combined row (SELECT *).
 	std::vector<uint16_t> projection{};
 	std::vector<BoundComparison> where{};  // implicit AND, as in the AST
+	std::vector<BoundSortKey> order_by{};  // empty means unordered
 };
 
 struct BoundDelete {

@@ -10,6 +10,7 @@
 #include "catalog/schema.hpp"
 #include "common/status.hpp"
 #include "indices/b_plus_tree_page.hpp"
+#include "sql/executor/planner.hpp"
 
 namespace kernsql {
 
@@ -41,8 +42,12 @@ class Executor {
   public:
 	// `index_fanout` is passed to every CREATE TABLE — tests only, so a handful of rows already
 	// makes a multi-level tree and range scans cross leaves (as Catalog::CreateTable's).
-	explicit Executor(Catalog& catalog, uint16_t index_fanout = NODE_CAPACITY)
-	    : catalog_(catalog), index_fanout_(index_fanout) {}
+	//
+	// `join` picks the join operator — also tests only: they run kNestedLoop as the oracle for
+	// kHash (planner.hpp).
+	explicit Executor(Catalog& catalog, uint16_t index_fanout = NODE_CAPACITY,
+	                  JoinAlgorithm join = JoinAlgorithm::kHash)
+	    : catalog_(catalog), index_fanout_(index_fanout), join_(join) {}
 
 	/*
 	 * Run one statement. Errors: the parser's and the binder's (see binder.hpp), then whatever
@@ -57,6 +62,7 @@ class Executor {
   private:
 	Catalog& catalog_;
 	uint16_t index_fanout_;
+	JoinAlgorithm join_;
 };
 
 /*

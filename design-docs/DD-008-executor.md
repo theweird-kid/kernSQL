@@ -15,8 +15,8 @@ In: `CREATE TABLE`, `INSERT ... VALUES`, `SELECT` with a projection and a `WHERE
 comparisons, `DELETE ... WHERE`, `EXPLAIN` on `SELECT` and `DELETE`, a rule-based choice between
 a sequential scan and a primary-key index range scan, and a SQL REPL.
 
-Out until the joins stage: `JOIN` and `ORDER BY`. They parse (DD-007 decision 1), and the binder
-rejects them with "not supported yet". Out entirely: transactions, `UPDATE`, aggregates, a cost
+Added by the joins stage (`feature/joins`, see [Joins](#joins)): one `JOIN ... ON a = b` between
+two different tables, and `ORDER BY`. Out entirely: transactions, `UPDATE`, aggregates, a cost
 model, and concurrency (stage 5 adds per-table locks).
 
 ## Pipeline
@@ -96,6 +96,44 @@ lets `EXPLAIN` build the real plan and print it without running anything.
 
 `IndexScan` reports an index entry whose RID names an empty slot as `kCorruption`, not as a
 missing row, matching `Table::Get`.
+
+## Joins
+
+Kept to the bare minimum on purpose: one join, inner, equality only, between two **different**
+tables (a self-join needs aliases, and there are none).
+
+**The combined row.** A join emits the `FROM` table's columns followed by the `JOIN` table's, and
+every position in a bound `SELECT` (projection, `WHERE`, `ORDER BY`) counts into that row. An
+unqualified name found in both tables is an error ("ambiguous column name"), as in Postgres.
+`ON` must be `x = y` with one column from each table, of the same type.
+
+**Two join operators, one interface.** Both read the right side into memory once, then stream the
+left side past it:
+
+| Operator | Finds a left row's matches by | Cost |
+|---|---|---|
+| `HashJoin` (used) | looking its key up in a hash table built on the right side | O(\|L\| + \|R\|) |
+| `NestedLoopJoin` (oracle) | comparing it with every right row | O(\|L\| · \|R\|) |
+
+Nested loop is too simple to be wrong, so the tests run every query through both and require the
+same rows **in the same order**: `HashJoin` sorts each bucket's matches back into right-side scan
+order. The build side is always the `JOIN` table; with no statistics there is nothing to choose
+by. The build side must fit in memory, as does a sort; there is no spilling to disk.
+
+**Pushdown.** A `WHERE` term naming only one table is pushed below the join, onto that table's
+`PlanScan`, so `pets.id = 3` still becomes an `IndexScan`. Only terms naming both tables (or
+neither) filter above the join:
+
+```
+Projection → Sort → Filter(cross-table terms) → HashJoin ┬ PlanScan(left,  left-only terms)
+                                                         └ PlanScan(right, right-only terms)
+```
+
+**`ORDER BY`** is an in-memory stable `Sort`, a pipeline breaker: it pulls every row before
+emitting one. It sits below `Projection`, because a sort key need not be projected.
+
+**Cut** from the original stage-4 plan, by choice: index nested-loop join, sort-merge join, outer
+joins, more than one `JOIN`.
 
 ## Collect, then mutate
 
@@ -177,3 +215,9 @@ is pinned**, and mutating tests also run `CheckConsistency()`.
   `DELETE`s mixed in. Planting bugs in the planner was caught every time: `<` treated as `<=`,
   a literal on the left not mirrored, and a missing `> INT64_MAX` guard.
 - `FormatResult` and `SplitStatements`, each with exact expected output.
+- `test/sql/join_test.cpp`: every query through **both** join operators, which must agree exactly.
+  Covers many-to-many duplicates, string keys, empty sides, name resolution and `ON` errors,
+  pushdown in `EXPLAIN`, `ORDER BY` with ties and `DESC`. A differential test runs 150 random
+  joins over tables full of duplicate join values against a hand-joined model, with and without
+  `ORDER BY`. Planted bugs (one match per hash key, a pushed-down term not renumbered, `DESC`
+  ignored) were each caught.

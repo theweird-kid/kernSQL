@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <memory>
 #include <vector>
 
@@ -19,6 +20,15 @@ namespace kernsql {
  *   2. FILTER over whatever terms are left, if any.
  *   3. PROJECTION, for a SELECT that is not `*`.
  *
+ * With a JOIN, each WHERE term that names only one table is PUSHED DOWN to that table's scan
+ * before the join (so `pets.id = 3` still becomes an IndexScan on pets), and only terms naming
+ * both tables, or neither, filter above it:
+ *
+ *   Projection → Sort → Filter(cross-table terms) → HashJoin ┬ PlanScan(left,  left-only terms)
+ *                                                           └ PlanScan(right, right-only terms)
+ *
+ * Sort sits below Projection because ORDER BY may name a column the SELECT does not output.
+ *
  * No statistics, no costs: an index range is always at least as good as a full scan for this
  * engine, because the heap has no ordering a scan could exploit. A cost model starts to matter
  * with joins, where the choice is between algorithms (stage 4).
@@ -27,7 +37,12 @@ namespace kernsql {
 // The scan plus any Filter for `where`, which is what both SELECT and DELETE need.
 [[nodiscard]] std::unique_ptr<Operator> PlanScan(Table& table, std::vector<BoundComparison> where);
 
-// PlanScan, then a Projection unless the projection is `*`.
-[[nodiscard]] std::unique_ptr<Operator> PlanSelect(const BoundSelect& select);
+// Which join operator to build. kHash always, except in tests, which run kNestedLoop as the
+// oracle for it (operators.hpp, JoinBase).
+enum class JoinAlgorithm : uint8_t { kHash, kNestedLoop };
+
+// The whole SELECT: scans (pushed-down terms), join, filter, sort, projection.
+[[nodiscard]] std::unique_ptr<Operator> PlanSelect(const BoundSelect& select,
+                                                   JoinAlgorithm join = JoinAlgorithm::kHash);
 
 }  // namespace kernsql

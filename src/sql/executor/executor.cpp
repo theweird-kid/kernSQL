@@ -69,18 +69,19 @@ Result<QueryResult> RunInsert(const BoundInsert& insert) {
 	return QueryResult{.tag = std::format("INSERT {}", insert.rows.size())};
 }
 
-Result<QueryResult> RunSelect(const BoundSelect& select, bool explain) {
-	std::unique_ptr<Operator> plan = PlanSelect(select);
+Result<QueryResult> RunSelect(const BoundSelect& select, bool explain, JoinAlgorithm join) {
+	std::unique_ptr<Operator> plan = PlanSelect(select, join);
 	if (explain) {
 		return ExplainResult(ExplainLines(*plan));
 	}
 
 	QueryResult result;
-	const std::vector<Column>& columns = select.table->GetSchema().Columns();
 	if (select.projection.empty()) {
-		for (const Column& column : columns) result.columns.push_back(column.name);
+		result.columns = select.column_names;
 	} else {
-		for (uint16_t index : select.projection) result.columns.push_back(columns[index].name);
+		for (uint16_t index : select.projection) {
+			result.columns.push_back(select.column_names[index]);
+		}
 	}
 
 	Result<std::vector<Row>> rows = Drain(*plan);
@@ -144,7 +145,7 @@ Result<QueryResult> Executor::Execute(std::string_view sql) {
 		    } else if constexpr (std::is_same_v<S, BoundInsert>) {
 			    return RunInsert(s);
 		    } else if constexpr (std::is_same_v<S, BoundSelect>) {
-			    return RunSelect(s, explain);
+			    return RunSelect(s, explain, join_);
 		    } else {
 			    return RunDelete(s, explain);
 		    }

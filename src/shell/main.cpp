@@ -114,6 +114,7 @@ void PrintHelp() {
 	std::println("  INSERT INTO t VALUES (1, 'alice'), (2, 'bob');");
 	std::println("  SELECT name FROM t WHERE id >= 1 AND name != 'bob';");
 	std::println("  DELETE FROM t WHERE id = 2;");
+	std::println("  SELECT t.name, u.x FROM t JOIN u ON t.id = u.tid ORDER BY u.x DESC;");
 	std::println("  EXPLAIN SELECT * FROM t WHERE id = 1;");
 	std::println("shell commands:");
 	std::println("  .tables          list tables");
