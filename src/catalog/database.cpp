@@ -34,3 +34,11 @@ Database::~Database() = default;
 Status Database::Shutdown() {
 	return bpm_->Shutdown();
 }
+
+Status Database::Checkpoint() {
+	// FlushAllPages moves page bytes into the OS; only Sync makes them survive a power cut.
+	if (Status st = bpm_->FlushAllPages(); !st.ok()) {
+		return st;
+	}
+	return dm_->Sync();
+}
