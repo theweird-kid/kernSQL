@@ -18,7 +18,10 @@ add_library(kernsql_lib STATIC
   src/catalog/schema.cpp
   src/catalog/table.cpp
   src/catalog/catalog.cpp
-  src/catalog/database.cpp)
+  src/catalog/database.cpp
+  src/sql/parser/token.cpp
+  src/sql/parser/ast.cpp
+  src/sql/parser/parser.cpp)
 target_include_directories(kernsql_lib PUBLIC src)
 target_compile_options(kernsql_lib PUBLIC -Wall -Wextra -Wpedantic -Wshadow -Wconversion
   -Werror=format)
